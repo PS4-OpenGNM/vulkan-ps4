@@ -105,8 +105,9 @@ VkResult vk_ps4_compile_shader_module(VkPs4ShaderModule *mod, VkShaderStageFlagB
     }
 
 #ifdef VK_PS4_HAVE_PSBC
-    /* Initialize libpsbc (refcounted — call psbc_shutdown to release) */
-    psbc_init();
+    /* libpsbc is initialized at device creation time (vk_ps4_CreateDevice).
+     * No per-compile init/shutdown needed — psbc_compile_shader is safe to
+     * call concurrently thanks to the refcounted init. */
 
     /* Set up compile options (zero-init to avoid stack garbage) */
     PsbcCompileOptions opts = {0};
@@ -123,7 +124,6 @@ VkResult vk_ps4_compile_shader_module(VkPs4ShaderModule *mod, VkShaderStageFlagB
     case VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT: opts.stage = PSBC_STAGE_TESS_CTRL; break;
     case VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT: opts.stage = PSBC_STAGE_TESS_EVAL; break;
     default:
-        psbc_shutdown();
         return VK_ERROR_FEATURE_NOT_PRESENT;
     }
 
@@ -137,7 +137,6 @@ VkResult vk_ps4_compile_shader_module(VkPs4ShaderModule *mod, VkShaderStageFlagB
     );
 
     if (result != PSBC_RESULT_OK) {
-        psbc_shutdown();
         return VK_ERROR_FEATURE_NOT_PRESENT;
     }
 
@@ -145,7 +144,6 @@ VkResult vk_ps4_compile_shader_module(VkPs4ShaderModule *mod, VkShaderStageFlagB
     void *binary_copy = vk_ps4_alloc(alloc, output.size, 16);
     if (!binary_copy) {
         psbc_free_output(&output);
-        psbc_shutdown();
         return VK_ERROR_OUT_OF_HOST_MEMORY;
     }
     memcpy(binary_copy, output.data, output.size);
@@ -165,7 +163,6 @@ VkResult vk_ps4_compile_shader_module(VkPs4ShaderModule *mod, VkShaderStageFlagB
     }
 
     psbc_free_output(&output);
-    psbc_shutdown();
     return VK_SUCCESS;
 #else
     (void)stage;

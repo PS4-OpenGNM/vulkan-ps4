@@ -6,6 +6,10 @@
 
 #include <string.h>
 
+#ifdef VK_PS4_HAVE_PSBC
+#include "psbc_compile.h"
+#endif
+
 VKAPI_ATTR VkResult VKAPI_CALL
 vk_ps4_CreateDevice(
     VkPhysicalDevice physicalDevice,
@@ -34,6 +38,12 @@ vk_ps4_CreateDevice(
     }
     dev->gnm_initialized = false; /* TODO: init GNM on PS4 */
 
+#ifdef VK_PS4_HAVE_PSBC
+    /* Initialize libpsbc once per device — refcounted internally.
+     * This avoids calling psbc_init/psbc_shutdown on every shader compile. */
+    psbc_init();
+#endif
+
     /* Pre-allocate queues from pCreateInfo so handles are stable */
     dev->queue_count = 0;
     for (uint32_t i = 0; i < pCreateInfo->queueCreateInfoCount; i++) {
@@ -45,6 +55,9 @@ vk_ps4_CreateDevice(
                 for (uint32_t k = 0; k < dev->queue_count; k++) {
                     vk_ps4_free(alloc, dev->queues[k]);
                 }
+#ifdef VK_PS4_HAVE_PSBC
+                psbc_shutdown();
+#endif
                 vk_ps4_free(alloc, dev);
                 return VK_ERROR_OUT_OF_HOST_MEMORY;
             }
@@ -75,6 +88,9 @@ vk_ps4_DestroyDevice(VkDevice device, const VkAllocationCallbacks *pAllocator) {
         }
     }
     dev->queue_count = 0;
+#ifdef VK_PS4_HAVE_PSBC
+    psbc_shutdown();
+#endif
     vk_ps4_free(alloc, dev);
 }
 
