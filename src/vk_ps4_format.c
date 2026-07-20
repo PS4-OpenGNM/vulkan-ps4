@@ -154,14 +154,73 @@ VkFormatProperties vk_ps4_format_properties(VkFormat format) {
             VkFormatProperties props = {
                 .linearTilingFeatures = g_format_table[i].features,
                 .optimalTilingFeatures = g_format_table[i].features,
-                .bufferFeatures = VK_FORMAT_FEATURE_UNIFORM_TEXEL_BUFFER_BIT |
-                                 VK_FORMAT_FEATURE_STORAGE_TEXEL_BUFFER_BIT |
-                                 VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT,
+                .bufferFeatures = VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT,
             };
+            /* Only advertise texel buffer features for formats that have
+             * a valid GnmBufferFormat equivalent. SRGB and BC compressed
+             * formats have no buffer representation — sceGnmBufSetFormat
+             * rejects them silently. */
+            GnmDataFormat gnm = g_format_table[i].gnm_format;
+            if (vk_ps4_gnm_format_is_buffer_compatible(gnm)) {
+                props.bufferFeatures |=
+                    VK_FORMAT_FEATURE_UNIFORM_TEXEL_BUFFER_BIT |
+                    VK_FORMAT_FEATURE_STORAGE_TEXEL_BUFFER_BIT;
+            }
             return props;
         }
     }
     /* Unsupported format */
     VkFormatProperties empty = {0};
     return empty;
+}
+
+bool vk_ps4_gnm_format_is_buffer_compatible(GnmDataFormat fmt) {
+    /* GnmBufferFormat supports: 8, 16, 8_8, 32, 16_16, 10_11_11, 11_11_10,
+     * 10_10_10_2, 2_10_10_10, 8_8_8_8, 32_32, 16_16_16_16, 32_32_32, 32_32_32_32.
+     * GnmBufNumFormat supports: UNORM, SNORM, USCALED, SSCALED, UINT, SINT, SNORM_OGL, FLOAT.
+     * Notably missing: SRGB (no buffer SRGB), BC1-7 (no compressed buffers),
+     * 16_16_16 (3-channel not in buffer format list). */
+    switch (fmt.surfacefmt) {
+    case GNM_IMG_DATA_FORMAT_8:
+    case GNM_IMG_DATA_FORMAT_16:
+    case GNM_IMG_DATA_FORMAT_8_8:
+    case GNM_IMG_DATA_FORMAT_32:
+    case GNM_IMG_DATA_FORMAT_16_16:
+    case GNM_IMG_DATA_FORMAT_10_11_11:
+    case GNM_IMG_DATA_FORMAT_11_11_10:
+    case GNM_IMG_DATA_FORMAT_10_10_10_2:
+    case GNM_IMG_DATA_FORMAT_2_10_10_10:
+    case GNM_IMG_DATA_FORMAT_8_8_8_8:
+    case GNM_IMG_DATA_FORMAT_32_32:
+    case GNM_IMG_DATA_FORMAT_16_16_16_16:
+    case GNM_IMG_DATA_FORMAT_32_32_32:
+    case GNM_IMG_DATA_FORMAT_32_32_32_32:
+        break;  /* valid buffer data format */
+    default:
+        return false;  /* BC1-7, 1, 1_REVERSED, etc. not buffer-compatible */
+    }
+    switch (fmt.chantype) {
+    case GNM_IMG_NUM_FORMAT_UNORM:
+    case GNM_IMG_NUM_FORMAT_SNORM:
+    case GNM_IMG_NUM_FORMAT_USCALED:
+    case GNM_IMG_NUM_FORMAT_SSCALED:
+    case GNM_IMG_NUM_FORMAT_UINT:
+    case GNM_IMG_NUM_FORMAT_SINT:
+    case GNM_IMG_NUM_FORMAT_FLOAT:
+        return true;
+    default:
+        return false;  /* SRGB, SNORM_OGL (IMG-only) not buffer-compatible */
+    }
+}
+
+GnmDataFormat vk_ps4_vk_format_to_gnm_buffer(VkFormat format) {
+    GnmDataFormat img_fmt = vk_ps4_vk_format_to_gnm(format);
+    if (!vk_ps4_gnm_format_is_buffer_compatible(img_fmt)) {
+        return GNM_FMT_INVALID;
+    }
+    /* The IMG and BUF format enums share the same numeric values for
+     * the common subset. The channel type (num format) also shares values
+     * for UNORM/SNORM/USCALED/SSCALED/UINT/SINT/FLOAT.
+     * So the GnmDataFormat can be used directly with sceGnmBufSetFormat. */
+    return img_fmt;
 }

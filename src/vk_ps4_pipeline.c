@@ -11,11 +11,72 @@
 
 #include <string.h>
 
+/* PM4 register definitions for stencil op/ref/mask programming. */
+#include <pm4/sid.h>
+#include <pm4/amdgfxregs.h>
+
 /* Forward declaration from vk_ps4_shader.c */
 VkResult vk_ps4_compile_shader_module(VkPs4ShaderModule *mod, VkShaderStageFlagBits stage,
                                       const VkAllocationCallbacks *alloc,
                                       void **out_binary, size_t *out_binary_size,
                                       GnmShaderMetadata *out_metadata);
+
+/* Forward declaration from vk_ps4_command.c */
+extern uint32_t vk_stencil_op_to_pm4(VkStencilOp op);
+
+/* === Blend state conversion === */
+
+static GnmBlendOp vk_blend_factor_to_gnm(VkBlendFactor f) {
+    switch (f) {
+    case VK_BLEND_FACTOR_ZERO:                       return GNM_BLEND_ZERO;
+    case VK_BLEND_FACTOR_ONE:                        return GNM_BLEND_ONE;
+    case VK_BLEND_FACTOR_SRC_COLOR:                  return GNM_BLEND_SRC_COLOR;
+    case VK_BLEND_FACTOR_ONE_MINUS_SRC_COLOR:        return GNM_BLEND_ONE_MINUS_SRC_COLOR;
+    case VK_BLEND_FACTOR_DST_COLOR:                  return GNM_BLEND_DEST_COLOR;
+    case VK_BLEND_FACTOR_ONE_MINUS_DST_COLOR:        return GNM_BLEND_ONE_MINUS_DEST_COLOR;
+    case VK_BLEND_FACTOR_SRC_ALPHA:                  return GNM_BLEND_SRC_ALPHA;
+    case VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA:        return GNM_BLEND_ONE_MINUS_SRC_ALPHA;
+    case VK_BLEND_FACTOR_DST_ALPHA:                  return GNM_BLEND_DEST_ALPHA;
+    case VK_BLEND_FACTOR_ONE_MINUS_DST_ALPHA:        return GNM_BLEND_ONE_MINUS_DEST_ALPHA;
+    case VK_BLEND_FACTOR_CONSTANT_COLOR:             return GNM_BLEND_CONSTANT_COLOR;
+    case VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_COLOR:   return GNM_BLEND_ONE_MINUS_CONSTANT_COLOR;
+    case VK_BLEND_FACTOR_CONSTANT_ALPHA:             return GNM_BLEND_CONSTANT_ALPHA;
+    case VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_ALPHA:   return GNM_BLEND_ONE_MINUS_CONSTANT_ALPHA;
+    case VK_BLEND_FACTOR_SRC_ALPHA_SATURATE:         return GNM_BLEND_SRC_ALPHA_SATURATE;
+    case VK_BLEND_FACTOR_SRC1_COLOR:                 return GNM_BLEND_SRC1_COLOR;
+    case VK_BLEND_FACTOR_ONE_MINUS_SRC1_COLOR:       return GNM_BLEND_INVERSE_SRC1_COLOR;
+    case VK_BLEND_FACTOR_SRC1_ALPHA:                 return GNM_BLEND_SRC1_ALPHA;
+    case VK_BLEND_FACTOR_ONE_MINUS_SRC1_ALPHA:       return GNM_BLEND_INVERSE_SRC1_ALPHA;
+    default:                                         return GNM_BLEND_ZERO;
+    }
+}
+
+static GnmCombFunc vk_blend_op_to_gnm(VkBlendOp op) {
+    switch (op) {
+    case VK_BLEND_OP_ADD:                 return GNM_COMB_DST_PLUS_SRC;
+    case VK_BLEND_OP_SUBTRACT:            return GNM_COMB_SRC_MINUS_DST;
+    case VK_BLEND_OP_REVERSE_SUBTRACT:    return GNM_COMB_DST_MINUS_SRC;
+    case VK_BLEND_OP_MIN:                 return GNM_COMB_MIN_DST_SRC;
+    case VK_BLEND_OP_MAX:                 return GNM_COMB_MAX_DST_SRC;
+    default:                              return GNM_COMB_DST_PLUS_SRC;
+    }
+}
+
+/* Convert a VkPipelineColorBlendAttachmentState to GnmBlendControl. */
+static void vk_blend_attachment_to_gnm(const VkPipelineColorBlendAttachmentState *att,
+                                        GnmBlendControl *out) {
+    memset(out, 0, sizeof(*out));
+    out->blendenabled = att->blendEnable ? true : false;
+    out->colorfunc = vk_blend_op_to_gnm(att->colorBlendOp);
+    out->colorsrcmult = vk_blend_factor_to_gnm(att->srcColorBlendFactor);
+    out->colordstmult = vk_blend_factor_to_gnm(att->dstColorBlendFactor);
+    out->alphafunc = vk_blend_op_to_gnm(att->alphaBlendOp);
+    out->alphasrcmult = vk_blend_factor_to_gnm(att->srcAlphaBlendFactor);
+    out->alphadstmult = vk_blend_factor_to_gnm(att->dstAlphaBlendFactor);
+    out->separatealphaenable = (att->alphaBlendOp != att->colorBlendOp ||
+        att->srcAlphaBlendFactor != att->srcColorBlendFactor ||
+        att->dstAlphaBlendFactor != att->dstColorBlendFactor);
+}
 
 GnmPrimitiveType vk_topology_to_gnm(VkPrimitiveTopology topology) {
     switch (topology) {
@@ -68,20 +129,158 @@ vk_ps4_CreateGraphicsPipelines(VkDevice device, VkPipelineCache pipelineCache,
         memset(&pipe->ps_regs, 0, sizeof(pipe->ps_regs));
         memset(&pipe->cs_regs, 0, sizeof(pipe->cs_regs));
 
-        /* Store pipeline state (shallow copy of structs — internal pointers
-         * like pVertexBindingDescriptions are NOT copied. For MVP we only
-         * use top-level fields like topology, polygonMode, etc. during
-         * CmdBindPipeline. Full deep copy is Phase 2.) */
-        if (ci->pVertexInputState)
+        /* Store pipeline state — deep copy vertex input state to avoid
+         * dangling pointers (app can free pVertexInputState after creation). */
+        if (ci->pVertexInputState) {
             pipe->vertex_input_state = *ci->pVertexInputState;
+            const VkPipelineVertexInputStateCreateInfo *vi = ci->pVertexInputState;
+            /* Deep copy vertex binding descriptions */
+            if (vi->vertexBindingDescriptionCount > 0 && vi->pVertexBindingDescriptions) {
+                uint32_t n = vi->vertexBindingDescriptionCount;
+                pipe->vertex_bindings = vk_ps4_alloc_zero(alloc,
+                    n * sizeof(VkVertexInputBindingDescription), 16);
+                if (pipe->vertex_bindings) {
+                    memcpy(pipe->vertex_bindings, vi->pVertexBindingDescriptions,
+                           n * sizeof(VkVertexInputBindingDescription));
+                    pipe->vertex_input_state.pVertexBindingDescriptions = pipe->vertex_bindings;
+                } else {
+                    /* Alloc failure — zero out to avoid dangling pointer */
+                    pipe->vertex_input_state.vertexBindingDescriptionCount = 0;
+                    pipe->vertex_input_state.pVertexBindingDescriptions = NULL;
+                }
+            } else {
+                pipe->vertex_input_state.vertexBindingDescriptionCount = 0;
+                pipe->vertex_input_state.pVertexBindingDescriptions = NULL;
+            }
+            /* Deep copy vertex attribute descriptions */
+            if (vi->vertexAttributeDescriptionCount > 0 && vi->pVertexAttributeDescriptions) {
+                uint32_t n = vi->vertexAttributeDescriptionCount;
+                pipe->vertex_attributes = vk_ps4_alloc_zero(alloc,
+                    n * sizeof(VkVertexInputAttributeDescription), 16);
+                if (pipe->vertex_attributes) {
+                    memcpy(pipe->vertex_attributes, vi->pVertexAttributeDescriptions,
+                           n * sizeof(VkVertexInputAttributeDescription));
+                    pipe->vertex_input_state.pVertexAttributeDescriptions = pipe->vertex_attributes;
+                } else {
+                    pipe->vertex_input_state.vertexAttributeDescriptionCount = 0;
+                    pipe->vertex_input_state.pVertexAttributeDescriptions = NULL;
+                }
+            } else {
+                pipe->vertex_input_state.vertexAttributeDescriptionCount = 0;
+                pipe->vertex_input_state.pVertexAttributeDescriptions = NULL;
+            }
+        }
         if (ci->pInputAssemblyState)
             pipe->input_assembly_state = *ci->pInputAssemblyState;
+        /* Tessellation state: patch control points */
+        if (ci->pTessellationState && ci->pTessellationState->patchControlPoints > 0) {
+            pipe->tess_patch_control_points = ci->pTessellationState->patchControlPoints;
+        }
         if (ci->pRasterizationState)
             pipe->rasterization_state = *ci->pRasterizationState;
-        if (ci->pColorBlendState)
+        if (ci->pColorBlendState) {
             pipe->color_blend_state = *ci->pColorBlendState;
-        if (ci->pDepthStencilState)
+            pipe->has_blend_state = true;
+
+            /* Deep copy blend attachment states (pAttachments is a pointer
+             * to caller-owned memory that may be freed after pipeline creation). */
+            const VkPipelineColorBlendStateCreateInfo *cb = ci->pColorBlendState;
+            if (cb->attachmentCount > 0 && cb->pAttachments) {
+                uint32_t n = cb->attachmentCount;
+                if (n > 8) n = 8;  /* max 8 RT slots */
+                pipe->blend_attachments = vk_ps4_alloc_zero(alloc,
+                    n * sizeof(VkPipelineColorBlendAttachmentState), 16);
+                if (pipe->blend_attachments) {
+                    memcpy(pipe->blend_attachments, cb->pAttachments,
+                           n * sizeof(VkPipelineColorBlendAttachmentState));
+                    pipe->color_blend_state.pAttachments = pipe->blend_attachments;
+                    pipe->color_blend_state.attachmentCount = n;
+
+                    /* Pre-compute GnmBlendControl for each RT slot */
+                    pipe->blend_control_count = n;
+                    pipe->color_write_mask = 0;
+                    for (uint32_t j = 0; j < n; j++) {
+                        vk_blend_attachment_to_gnm(&cb->pAttachments[j],
+                            &pipe->blend_controls[j]);
+                        /* Pack colorWriteMask into 4-bit-per-RT mask */
+                        uint32_t wm = cb->pAttachments[j].colorWriteMask & 0xF;
+                        pipe->color_write_mask |= wm << (j * 4);
+                    }
+                } else {
+                    pipe->color_blend_state.pAttachments = NULL;
+                    pipe->color_blend_state.attachmentCount = 0;
+                    pipe->blend_control_count = 0;
+                    pipe->color_write_mask = 0xFFFFFFFF;  /* write all by default */
+                }
+            } else {
+                pipe->color_blend_state.pAttachments = NULL;
+                pipe->color_blend_state.attachmentCount = 0;
+                pipe->blend_control_count = 0;
+                pipe->color_write_mask = 0xFFFFFFFF;  /* write all by default */
+            }
+
+            /* Copy blend constants */
+            memcpy(pipe->blend_constants, cb->blendConstants, sizeof(pipe->blend_constants));
+        } else {
+            pipe->has_blend_state = false;
+            pipe->color_write_mask = 0xFFFFFFFF;  /* write all by default */
+        }
+        if (ci->pDepthStencilState) {
             pipe->depth_stencil_state = *ci->pDepthStencilState;
+            pipe->has_depth_stencil_state = true;
+
+            /* Convert VkPipelineDepthStencilStateCreateInfo to GNM state */
+            const VkPipelineDepthStencilStateCreateInfo *ds = ci->pDepthStencilState;
+            GnmDepthStencilControl *dsc = &pipe->depth_stencil_control;
+            memset(dsc, 0, sizeof(*dsc));
+
+            dsc->depthenable = ds->depthTestEnable;
+            dsc->zwrite = ds->depthWriteEnable;
+            dsc->zfunc = (GnmDepthCompare)ds->depthCompareOp;
+            dsc->depthboundsenable = ds->depthBoundsTestEnable;
+            dsc->stencilenable = ds->stencilTestEnable;
+            dsc->separatestencilenable = false;
+
+            if (ds->stencilTestEnable) {
+                /* Front face stencil */
+                dsc->stencilfunc = (GnmDepthCompare)ds->front.compareOp;
+                /* Check if back face is different from front */
+                if (ds->back.compareOp != ds->front.compareOp ||
+                    ds->back.failOp != ds->front.failOp ||
+                    ds->back.passOp != ds->front.passOp ||
+                    ds->back.depthFailOp != ds->front.depthFailOp ||
+                    ds->back.compareMask != ds->front.compareMask ||
+                    ds->back.writeMask != ds->front.writeMask ||
+                    ds->back.reference != ds->front.reference) {
+                    dsc->separatestencilenable = true;
+                    dsc->stencilbackfunc = (GnmDepthCompare)ds->back.compareOp;
+                }
+
+                /* Pre-compute DB_STENCIL_CONTROL (ops for front and back) */
+                pipe->stencil_control =
+                    S_02842C_STENCILFAIL(vk_stencil_op_to_pm4(ds->front.failOp)) |
+                    S_02842C_STENCILZPASS(vk_stencil_op_to_pm4(ds->front.passOp)) |
+                    S_02842C_STENCILZFAIL(vk_stencil_op_to_pm4(ds->front.depthFailOp));
+                if (dsc->separatestencilenable) {
+                    pipe->stencil_control |=
+                        S_02842C_STENCILFAIL_BF(vk_stencil_op_to_pm4(ds->back.failOp)) |
+                        S_02842C_STENCILZPASS_BF(vk_stencil_op_to_pm4(ds->back.passOp)) |
+                        S_02842C_STENCILZFAIL_BF(vk_stencil_op_to_pm4(ds->back.depthFailOp));
+                }
+
+                /* Pre-compute DB_STENCILREFMASK (front) */
+                pipe->stencil_refmask =
+                    S_028430_STENCILTESTVAL(ds->front.reference) |
+                    S_028430_STENCILMASK(ds->front.compareMask) |
+                    S_028430_STENCILWRITEMASK(ds->front.writeMask);
+
+                /* Pre-compute DB_STENCILREFMASK_BF (back) */
+                pipe->stencil_refmask_bf =
+                    S_028434_STENCILTESTVAL_BF(ds->back.reference) |
+                    S_028434_STENCILMASK_BF(ds->back.compareMask) |
+                    S_028434_STENCILWRITEMASK_BF(ds->back.writeMask);
+            }
+        }
         if (ci->pViewportState)
             pipe->viewport_state = *ci->pViewportState;
         if (ci->pMultisampleState)
@@ -115,21 +314,46 @@ vk_ps4_CreateGraphicsPipelines(VkDevice device, VkPipelineCache pipelineCache,
 
                 switch (stage->stage) {
                 case VK_SHADER_STAGE_VERTEX_BIT: {
-                    const GnmVsShader *vs = (const GnmVsShader *)metadata.stage;
-                    pipe->vs_regs = vs->registers;
+                    /* The shader compiler may output different binary types
+                     * depending on the pipeline configuration:
+                     * - GNM_SHADER_VERTEX: standard VS (VS_VS)
+                     * - GNM_SHADER_LOCAL: LS (VS before tessellation)
+                     * - GNM_SHADER_EXPORT: ES (VS before geometry shader)
+                     * All three start with GnmShaderCommonData, but the
+                     * stage registers differ. */
+                    const uint8_t *stage_ptr = (const uint8_t *)metadata.stage;
+                    if (metadata.type == GNM_SHADER_LOCAL) {
+                        /* LS: GnmShaderCommonData + GnmLsStageRegisters */
+                        const GnmLsStageRegisters *ls_regs =
+                            (const GnmLsStageRegisters *)(stage_ptr + sizeof(GnmShaderCommonData));
+                        pipe->ls_regs = *ls_regs;
+                        pipe->has_ls = true;
+                        /* LS doesn't have vertex input semantics in the same
+                         * format — skip semantic extraction for LS */
+                    } else if (metadata.type == GNM_SHADER_EXPORT) {
+                        /* ES: GnmShaderCommonData + GnmEsStageRegisters */
+                        const GnmEsStageRegisters *es_regs =
+                            (const GnmEsStageRegisters *)(stage_ptr + sizeof(GnmShaderCommonData));
+                        pipe->es_regs = *es_regs;
+                        pipe->has_es = true;
+                    } else {
+                        /* Standard VS: GnmVsShader (common + regs + semantics) */
+                        const GnmVsShader *vs = (const GnmVsShader *)metadata.stage;
+                        pipe->vs_regs = vs->registers;
+                        /* Extract vertex input semantics */
+                        uint32_t nsemantics = vs->numinputsemantics;
+                        if (nsemantics > VK_PS4_MAX_INPUT_USAGE_SLOTS) nsemantics = VK_PS4_MAX_INPUT_USAGE_SLOTS;
+                        const GnmVertexInputSemantic *semantics = sceGnmVsShaderInputSemanticTable(vs);
+                        if (semantics && nsemantics > 0) {
+                            memcpy(pipe->vs_input_semantics, semantics, nsemantics * sizeof(GnmVertexInputSemantic));
+                            pipe->vs_input_semantic_count = nsemantics;
+                        }
+                    }
                     pipe->vs_module = mod;
                     vs_found = true;
                     if (slots && nslots > 0) {
                         memcpy(pipe->vs_input_usage_slots, slots, nslots * sizeof(GnmInputUsageSlot));
                         pipe->vs_input_usage_slot_count = nslots;
-                    }
-                    /* Extract vertex input semantics */
-                    uint32_t nsemantics = vs->numinputsemantics;
-                    if (nsemantics > VK_PS4_MAX_INPUT_USAGE_SLOTS) nsemantics = VK_PS4_MAX_INPUT_USAGE_SLOTS;
-                    const GnmVertexInputSemantic *semantics = sceGnmVsShaderInputSemanticTable(vs);
-                    if (semantics && nsemantics > 0) {
-                        memcpy(pipe->vs_input_semantics, semantics, nsemantics * sizeof(GnmVertexInputSemantic));
-                        pipe->vs_input_semantic_count = nsemantics;
                     }
                     break;
                 }
@@ -138,21 +362,53 @@ vk_ps4_CreateGraphicsPipelines(VkDevice device, VkPipelineCache pipelineCache,
                     pipe->ps_regs = ps->registers;
                     pipe->fs_module = mod;
                     ps_found = true;
+                    pipe->has_ps = true;
                     if (slots && nslots > 0) {
                         memcpy(pipe->ps_input_usage_slots, slots, nslots * sizeof(GnmInputUsageSlot));
                         pipe->ps_input_usage_slot_count = nslots;
                     }
                     break;
                 }
-                case VK_SHADER_STAGE_GEOMETRY_BIT:
+                case VK_SHADER_STAGE_GEOMETRY_BIT: {
+                    /* GS shader binary: GnmShaderCommonData + GnmGsStageRegisters */
+                    const uint8_t *stage_ptr = (const uint8_t *)metadata.stage;
+                    const GnmGsStageRegisters *gs_regs =
+                        (const GnmGsStageRegisters *)(stage_ptr + sizeof(GnmShaderCommonData));
+                    pipe->gs_regs = *gs_regs;
                     pipe->gs_module = mod;
+                    pipe->has_gs = true;
                     break;
-                case VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT:
+                }
+                case VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT: {
+                    /* TCS (hull shader): GnmShaderCommonData + GnmHsStageRegisters */
+                    const uint8_t *stage_ptr = (const uint8_t *)metadata.stage;
+                    const GnmHsStageRegisters *hs_regs =
+                        (const GnmHsStageRegisters *)(stage_ptr + sizeof(GnmShaderCommonData));
+                    pipe->hs_regs = *hs_regs;
                     pipe->tcs_module = mod;
+                    pipe->has_hs = true;
                     break;
-                case VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT:
+                }
+                case VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT: {
+                    /* TES (domain shader): compiled as VS (DS_VS) or ES (DS_ES).
+                     * The shader type in the binary header tells us which.
+                     * For DS_VS: GnmShaderCommonData + GnmVsStageRegisters
+                     * For DS_ES: GnmShaderCommonData + GnmEsStageRegisters
+                     * We store it as VS regs (DS_VS is the common case). */
+                    const uint8_t *stage_ptr = (const uint8_t *)metadata.stage;
+                    if (metadata.type == GNM_SHADER_EXPORT) {
+                        const GnmEsStageRegisters *es_regs =
+                            (const GnmEsStageRegisters *)(stage_ptr + sizeof(GnmShaderCommonData));
+                        pipe->es_regs = *es_regs;
+                        pipe->has_es = true;
+                    } else {
+                        /* DS_VS: treat as vertex shader */
+                        const GnmVsShader *vs = (const GnmVsShader *)metadata.stage;
+                        pipe->vs_regs = vs->registers;
+                    }
                     pipe->tes_module = mod;
                     break;
+                }
                 default:
                     break;
                 }
@@ -166,6 +422,10 @@ vk_ps4_CreateGraphicsPipelines(VkDevice device, VkPipelineCache pipelineCache,
 
         /* A graphics pipeline must have at least VS with valid registers */
         if (!compile_ok || !vs_found) {
+            vk_ps4_free(alloc, pipe->vertex_bindings);
+            vk_ps4_free(alloc, pipe->vertex_attributes);
+            vk_ps4_free(alloc, pipe->blend_attachments);
+            vk_ps4_free(alloc, pipe->fetch_shader);
             vk_ps4_free(alloc, pipe);
             pPipelines[i] = VK_NULL_HANDLE;
             overall_result = VK_ERROR_FEATURE_NOT_PRESENT;
@@ -183,12 +443,25 @@ vk_ps4_CreateGraphicsPipelines(VkDevice device, VkPipelineCache pipelineCache,
         if (pipe->vs_input_semantic_count > 0 && pipe->vs_input_usage_slot_count > 0) {
             /* Find the fetch shader slot and vertex buffer table slot
              * from the input usage slot table */
+            bool has_fs_slot = false;
+            bool has_vb_slot = false;
             for (uint32_t s = 0; s < pipe->vs_input_usage_slot_count; s++) {
                 if (pipe->vs_input_usage_slots[s].usagetype == GNM_SHINPUTUSAGE_SUBPTR_FETCHSHADER) {
                     pipe->fetch_shader_slot = pipe->vs_input_usage_slots[s].startregister;
+                    has_fs_slot = true;
                 } else if (pipe->vs_input_usage_slots[s].usagetype == GNM_SHINPUTUSAGE_PTR_VERTEXBUFFERTABLE) {
                     pipe->vertex_buffer_table_slot = pipe->vs_input_usage_slots[s].startregister;
+                    has_vb_slot = true;
                 }
+            }
+
+            /* Only create the fetch shader if the shader has a fetch shader
+             * slot in its usage table. Without it, the fetch shader pointer
+             * can't be emitted to the GPU. */
+            if (!has_fs_slot) {
+                /* No fetch shader slot — skip fetch shader creation.
+                 * Vertex input won't work, but this is a shader issue. */
+                goto skip_fetch_shader;
             }
 
             /* Build instancing modes from Vulkan vertex input binding descriptions */
@@ -230,6 +503,8 @@ vk_ps4_CreateGraphicsPipelines(VkDevice device, VkPipelineCache pipelineCache,
                     if (gerr == GNM_ERROR_OK) {
                         sceGnmVsRegsSetFetchShaderModifier(&pipe->vs_regs, &fetch_res);
                         pipe->has_fetch_shader = true;
+                        pipe->has_fetch_shader_slot = has_fs_slot;
+                        pipe->has_vb_table_slot = has_vb_slot;
                     } else {
                         vk_ps4_free(alloc, pipe->fetch_shader);
                         pipe->fetch_shader = NULL;
@@ -238,6 +513,7 @@ vk_ps4_CreateGraphicsPipelines(VkDevice device, VkPipelineCache pipelineCache,
                 }
             }
         }
+        skip_fetch_shader: ;
 
         pPipelines[i] = (VkPipeline)pipe;
     }
@@ -293,33 +569,54 @@ vk_ps4_CreateComputePipelines(VkDevice device, VkPipelineCache pipelineCache,
         if (metadata.fileheader && metadata.common) {
             pipe->cs_module = mod;
 
-            /* Set up CS stage registers — the CS shader binary doesn't
-             * contain GnmCsStageRegisters; the driver fills them in.
-             * The shader code address is set via sceGnmCsRegsSetAddress. */
-            if (metadata.shadercode) {
-                sceGnmCsRegsSetAddress(&pipe->cs_regs, metadata.shadercode);
+            /* For CS, sceGnmShaderBinaryGetMetadata falls through to the
+             * default case: it doesn't set metadata.shadercode or
+             * metadata.inputusageslots. We must compute them manually.
+             *
+             * The binary layout is:
+             *   GnmShaderFileHeader (0x10 bytes)
+             *   GnmShaderCommonData (0x8 bytes)
+             *   [stage-specific header, if any]
+             *   GnmInputUsageSlot[numinputusageslots]
+             *   shader code (shadersize dwords)
+             *
+             * The header size (in bytes) is:
+             *   headersizedwords * 4 (covers CommonData + stage header + slots)
+             * The shader code starts right after the header.
+             */
+            const uint8_t *base = (const uint8_t *)metadata.common;
+            uint32_t nslots = metadata.numinputusageslots;
+            if (nslots > VK_PS4_MAX_INPUT_USAGE_SLOTS)
+                nslots = VK_PS4_MAX_INPUT_USAGE_SLOTS;
 
-                /* Set thread group counts from the shader's resource regs.
-                 * For now, leave them at 0 — they'll be set per-dispatch
-                 * by the hardware based on the dispatch dimensions. */
+            /* The header size (in bytes) is headersizedwords * 4.
+             * When headersizedwords == 0, compute the header size manually:
+             * CommonData + input usage slots. */
+            uint32_t header_bytes = metadata.fileheader->headersizedwords
+                ? metadata.fileheader->headersizedwords * 4u
+                : (uint32_t)(sizeof(GnmShaderCommonData) +
+                             nslots * sizeof(GnmInputUsageSlot));
 
-                /* Extract CS input usage slots — for CS, the input usage
-                 * slot table follows GnmShaderCommonData in the binary.
-                 * The metadata extraction doesn't set inputusageslots for
-                 * CS (falls through to default), so we extract them here. */
-                if (metadata.numinputusageslots > 0 && metadata.common) {
-                    const uint8_t *base = (const uint8_t *)metadata.common;
+            /* Shader code pointer = base + header_bytes */
+            void *cs_code = (void *)(base + header_bytes);
+            sceGnmCsRegsSetAddress(&pipe->cs_regs, cs_code);
+
+            /* Extract CS input usage slots.
+             * For CS, the slot table follows GnmShaderCommonData. */
+            if (nslots > 0) {
+                /* Bounds check: ensure slot table fits within the binary */
+                uint32_t slots_bytes = (uint32_t)(sizeof(GnmShaderCommonData) +
+                                   nslots * sizeof(GnmInputUsageSlot));
+                if (slots_bytes <= mod->binary_size) {
                     const GnmInputUsageSlot *cs_slots =
                         (const GnmInputUsageSlot *)(base + sizeof(GnmShaderCommonData));
-                    uint32_t nslots = metadata.numinputusageslots;
-                    if (nslots > VK_PS4_MAX_INPUT_USAGE_SLOTS) nslots = VK_PS4_MAX_INPUT_USAGE_SLOTS;
-                    memcpy(pipe->vs_input_usage_slots, cs_slots, nslots * sizeof(GnmInputUsageSlot));
-                    /* Store CS slots in vs_input_usage_slots for CmdBindDescriptorSets */
+                    memcpy(pipe->vs_input_usage_slots, cs_slots,
+                           nslots * sizeof(GnmInputUsageSlot));
                     pipe->vs_input_usage_slot_count = nslots;
                 }
-
-                cs_ok = true;
             }
+
+            cs_ok = true;
         }
 
         if (binary && binary != mod->binary) {
@@ -347,6 +644,15 @@ vk_ps4_DestroyPipeline(VkDevice device, VkPipeline pipeline, const VkAllocationC
     const VkAllocationCallbacks *alloc = pAllocator ? pAllocator : &dev->allocator;
     if (pipe->fetch_shader) {
         vk_ps4_free(alloc, pipe->fetch_shader);
+    }
+    if (pipe->vertex_bindings) {
+        vk_ps4_free(alloc, pipe->vertex_bindings);
+    }
+    if (pipe->vertex_attributes) {
+        vk_ps4_free(alloc, pipe->vertex_attributes);
+    }
+    if (pipe->blend_attachments) {
+        vk_ps4_free(alloc, pipe->blend_attachments);
     }
     vk_ps4_free(alloc, pipe);
 }
@@ -519,6 +825,8 @@ vk_ps4_AllocateDescriptorSets(VkDevice device, const VkDescriptorSetAllocateInfo
             for (uint32_t b = 0; b < set->binding_count; b++) {
                 set->bindings[b].type = set->layout->bindings[b].descriptorType;
                 set->bindings[b].count = set->layout->bindings[b].descriptorCount;
+                set->bindings[b].binding_number = set->layout->bindings[b].binding;
+                set->bindings[b].resources_allocated = false;
                 set->bindings[b].buffers = NULL;
                 set->bindings[b].textures = NULL;
                 set->bindings[b].samplers = NULL;

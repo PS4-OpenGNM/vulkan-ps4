@@ -343,6 +343,56 @@ int main(void) {
         vkDestroyInstance(inst, NULL);
     }
 
+    /* Test: Buffer view format compatibility (Bug: SRGB/BC silently broken) */
+    {
+        /* R8_UNORM should be buffer-compatible */
+        GnmDataFormat fmt_r8 = vk_ps4_vk_format_to_gnm(VK_FORMAT_R8_UNORM);
+        CHECK(vk_ps4_gnm_format_is_buffer_compatible(fmt_r8) == true,
+              "R8_UNORM is buffer-compatible");
+
+        /* R32_SFLOAT should be buffer-compatible */
+        GnmDataFormat fmt_r32 = vk_ps4_vk_format_to_gnm(VK_FORMAT_R32_SFLOAT);
+        CHECK(vk_ps4_gnm_format_is_buffer_compatible(fmt_r32) == true,
+              "R32_SFLOAT is buffer-compatible");
+
+        /* R8G8B8A8_SRGB should NOT be buffer-compatible (no SRGB in buffer format) */
+        GnmDataFormat fmt_srgb = vk_ps4_vk_format_to_gnm(VK_FORMAT_R8G8B8A8_SRGB);
+        CHECK(vk_ps4_gnm_format_is_buffer_compatible(fmt_srgb) == false,
+              "R8G8B8A8_SRGB is NOT buffer-compatible");
+
+        /* BC1_RGB_UNORM should NOT be buffer-compatible (no BC in buffer format) */
+        GnmDataFormat fmt_bc1 = vk_ps4_vk_format_to_gnm(VK_FORMAT_BC1_RGB_UNORM_BLOCK);
+        CHECK(vk_ps4_gnm_format_is_buffer_compatible(fmt_bc1) == false,
+              "BC1_RGB_UNORM is NOT buffer-compatible");
+
+        /* vk_ps4_vk_format_to_gnm_buffer should return INVALID for SRGB */
+        GnmDataFormat buf_srgb = vk_ps4_vk_format_to_gnm_buffer(VK_FORMAT_R8G8B8A8_SRGB);
+        CHECK(buf_srgb.asuint == 0, "vk_format_to_gnm_buffer returns INVALID for SRGB");
+
+        /* vk_ps4_vk_format_to_gnm_buffer should return valid for UNORM */
+        GnmDataFormat buf_unorm = vk_ps4_vk_format_to_gnm_buffer(VK_FORMAT_R8G8B8A8_UNORM);
+        CHECK(buf_unorm.asuint != 0, "vk_format_to_gnm_buffer returns valid for UNORM");
+    }
+
+    /* Test: Buffer features only advertise texel buffer for compatible formats */
+    {
+        /* R8G8B8A8_UNORM should have texel buffer features */
+        VkFormatProperties props_unorm = vk_ps4_format_properties(VK_FORMAT_R8G8B8A8_UNORM);
+        CHECK((props_unorm.bufferFeatures & VK_FORMAT_FEATURE_UNIFORM_TEXEL_BUFFER_BIT) != 0,
+              "R8G8B8A8_UNORM has UNIFORM_TEXEL_BUFFER feature");
+
+        /* R8G8B8A8_SRGB should NOT have texel buffer features */
+        VkFormatProperties props_srgb = vk_ps4_format_properties(VK_FORMAT_R8G8B8A8_SRGB);
+        CHECK((props_srgb.bufferFeatures & VK_FORMAT_FEATURE_UNIFORM_TEXEL_BUFFER_BIT) == 0,
+              "R8G8B8A8_SRGB does NOT have UNIFORM_TEXEL_BUFFER feature");
+
+        /* Both should still have VERTEX_BUFFER feature */
+        CHECK((props_unorm.bufferFeatures & VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT) != 0,
+              "R8G8B8A8_UNORM has VERTEX_BUFFER feature");
+        CHECK((props_srgb.bufferFeatures & VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT) != 0,
+              "R8G8B8A8_SRGB has VERTEX_BUFFER feature");
+    }
+
     printf("\n%d/%d tests passed\n", test_pass, test_count);
     return (test_pass == test_count) ? 0 : 1;
 }

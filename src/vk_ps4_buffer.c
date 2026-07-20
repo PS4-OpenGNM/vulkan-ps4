@@ -80,3 +80,90 @@ vk_ps4_BindBufferMemory(VkDevice device, VkBuffer buffer, VkDeviceMemory memory,
 
     return VK_SUCCESS;
 }
+
+/* === Buffer View === */
+
+VKAPI_ATTR VkResult VKAPI_CALL
+vk_ps4_CreateBufferView(VkDevice device, const VkBufferViewCreateInfo *pCreateInfo,
+                        const VkAllocationCallbacks *pAllocator, VkBufferView *pBufferView) {
+    if (!device || !pCreateInfo || !pBufferView) {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    if (pCreateInfo->sType != VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO) {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+
+    VkPs4Device *dev = (VkPs4Device *)device;
+    const VkAllocationCallbacks *alloc = pAllocator ? pAllocator : &dev->allocator;
+
+    VkPs4Buffer *buf = (VkPs4Buffer *)pCreateInfo->buffer;
+    if (!buf || !buf->memory || !buf->memory->gnm_mem.mapped) {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+
+    /* Validate offset/range against buffer size */
+    if (pCreateInfo->offset > buf->create_info.size) {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    uint64_t range = pCreateInfo->range;
+    if (range == VK_WHOLE_SIZE) {
+        range = buf->create_info.size - pCreateInfo->offset;
+    }
+    if (pCreateInfo->offset + range > buf->create_info.size) {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+
+    /* Convert VkFormat to a BUF-compatible GnmDataFormat.
+     * SRGB and BC compressed formats have no buffer representation. */
+    GnmDataFormat fmt = vk_ps4_vk_format_to_gnm_buffer(pCreateInfo->format);
+    if (fmt.asuint == 0) {
+        return VK_ERROR_FORMAT_NOT_SUPPORTED;
+    }
+
+    VkPs4BufferView *view = vk_ps4_alloc_zero(alloc, sizeof(*view), 16);
+    if (!view) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    view->type = VK_PS4_OBJ_BUFFER_VIEW;
+    view->device = dev;
+    view->buffer = buf;
+    view->format = pCreateInfo->format;
+    view->offset = pCreateInfo->offset;
+    view->range = pCreateInfo->range;
+
+    /* Build the V# (GnmBuffer) descriptor for texel buffer access.
+     * The base address is the buffer's GPU address + view offset. */
+    void *base_addr = (char *)buf->memory->gnm_mem.mapped +
+                      buf->memory_offset + pCreateInfo->offset;
+    sceGnmBufSetBaseAddress(&view->gnm_buffer, base_addr);
+
+    /* Set the BUF-compatible format */
+    sceGnmBufSetFormat(&view->gnm_buffer, fmt);
+
+    /* Determine the element size and total range */
+    uint32_t element_size = sceGnmDfGetBytesPerElement(fmt);
+    if (element_size == 0) element_size = 4;
+
+    /* Validate offset alignment to element size */
+    if (pCreateInfo->offset % element_size != 0) {
+        vk_ps4_free(alloc, view);
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+
+    /* Stride = element size (texel buffer: one texel per record) */
+    view->gnm_buffer.stride = element_size;
+    view->gnm_buffer.numrecords = (uint32_t)(range / element_size);
+
+    /* Read-only memory type for uniform texel buffers */
+    sceGnmBufSetMemoryType(&view->gnm_buffer, GNM_MEMORY_READONLY, false, false);
+
+    *pBufferView = (VkBufferView)view;
+    return VK_SUCCESS;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+vk_ps4_DestroyBufferView(VkDevice device, VkBufferView bufferView, const VkAllocationCallbacks *pAllocator) {
+    if (!device || !bufferView) return;
+    VkPs4Device *dev = (VkPs4Device *)device;
+    VkPs4BufferView *view = (VkPs4BufferView *)bufferView;
+    const VkAllocationCallbacks *alloc = pAllocator ? pAllocator : &dev->allocator;
+    vk_ps4_free(alloc, view);
+}

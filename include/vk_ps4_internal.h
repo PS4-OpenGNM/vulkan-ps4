@@ -93,6 +93,7 @@ typedef struct VkPs4CommandPool VkPs4CommandPool;
 typedef struct VkPs4CommandBuffer VkPs4CommandBuffer;
 typedef struct VkPs4DeviceMemory VkPs4DeviceMemory;
 typedef struct VkPs4Buffer VkPs4Buffer;
+typedef struct VkPs4BufferView VkPs4BufferView;
 typedef struct VkPs4Image VkPs4Image;
 typedef struct VkPs4ImageView VkPs4ImageView;
 typedef struct VkPs4RenderPass VkPs4RenderPass;
@@ -180,6 +181,9 @@ struct VkPs4CommandBuffer {
         VkPs4RenderPass *pass;
         VkPs4Framebuffer *framebuffer;
         VkRect2D render_area;
+        uint32_t current_subpass;  /* index into pass->subpasses */
+        const VkClearValue *p_clear_values;  /* from CmdBeginRenderPass */
+        uint32_t clear_value_count;
     } current_render_pass;
     /* Current pipeline */
     VkPs4Pipeline *current_pipeline;
@@ -200,6 +204,12 @@ struct VkPs4CommandBuffer {
         VkDeviceSize offset;
         VkIndexType type;
     } index_buffer;
+    /* Shadow stencil state for read-modify-write on dynamic stencil commands.
+     * Without this, each CmdSetStencil* would clobber the other fields of
+     * DB_STENCILREFMASK / DB_STENCILREFMASK_BF. */
+    uint32_t stencil_refmask_front;   /* DB_STENCILREFMASK shadow */
+    uint32_t stencil_refmask_back;    /* DB_STENCILREFMASK_BF shadow */
+    bool stencil_shadow_valid;        /* initialized from pipeline bind */
 };
 
 /* === Memory === */
@@ -224,6 +234,17 @@ struct VkPs4Buffer {
     VkDeviceSize memory_offset;
 };
 
+/* === Buffer View === */
+struct VkPs4BufferView {
+    VkPs4ObjectType type;
+    VkPs4Device *device;
+    VkPs4Buffer *buffer;
+    GnmBuffer gnm_buffer;       /* V# descriptor for texel buffer access */
+    VkFormat format;
+    VkDeviceSize offset;
+    VkDeviceSize range;
+};
+
 /* === Image === */
 struct VkPs4Image {
     VkPs4ObjectType type;
@@ -231,7 +252,9 @@ struct VkPs4Image {
     VkImageCreateInfo create_info;
     GnmTexture gnm_texture;
     GnmRenderTarget gnm_rt;        /* if used as render target */
+    GnmDepthRenderTarget gnm_drt;  /* if used as depth target */
     bool is_render_target;
+    bool is_depth_target;
     VkPs4DeviceMemory *memory;
     VkDeviceSize memory_offset;
     VkImageLayout layout;
@@ -320,11 +343,29 @@ struct VkPs4Pipeline {
     GnmVsStageRegisters vs_regs;
     GnmPsStageRegisters ps_regs;
     GnmCsStageRegisters cs_regs;
+    /* Tessellation / geometry shader stage registers */
+    GnmHsStageRegisters hs_regs;
+    GnmLsStageRegisters ls_regs;
+    GnmGsStageRegisters gs_regs;
+    GnmEsStageRegisters es_regs;
+    bool has_hs;  /* tessellation control shader (hull shader) */
+    bool has_ls;  /* tessellation control shader (LS = VS before tess) */
+    bool has_gs;  /* geometry shader */
+    bool has_es;  /* geometry shader (ES = VS before GS) */
+    uint32_t tess_patch_control_points;  /* from VkPipelineTessellationStateCreateInfo */
     /* Pipeline state */
     VkPipelineVertexInputStateCreateInfo vertex_input_state;
+    VkVertexInputBindingDescription *vertex_bindings;      /* deep copy */
+    VkVertexInputAttributeDescription *vertex_attributes;  /* deep copy */
     VkPipelineInputAssemblyStateCreateInfo input_assembly_state;
     VkPipelineRasterizationStateCreateInfo rasterization_state;
     VkPipelineColorBlendStateCreateInfo color_blend_state;
+    VkPipelineColorBlendAttachmentState *blend_attachments;  /* deep copy */
+    GnmBlendControl blend_controls[8];  /* pre-computed per RT slot */
+    uint32_t blend_control_count;       /* number of valid blend_controls */
+    uint32_t color_write_mask;          /* packed RT mask (4 bits per RT) */
+    float blend_constants[4];
+    bool has_blend_state;
     VkPipelineDepthStencilStateCreateInfo depth_stencil_state;
     VkPipelineViewportStateCreateInfo viewport_state;
     VkPipelineMultisampleStateCreateInfo multisample_state;
@@ -332,6 +373,9 @@ struct VkPs4Pipeline {
     void *fetch_shader;
     size_t fetch_shader_size;
     bool has_fetch_shader;
+    bool has_ps;          /* true if fragment shader was set */
+    bool has_fetch_shader_slot;  /* true if fetch_shader_slot is valid */
+    bool has_vb_table_slot;      /* true if vertex_buffer_table_slot is valid */
     /* User-data slot for fetch shader pointer (SUBPTR_FETCHSHADER) */
     uint32_t fetch_shader_slot;
     /* User-data slot for vertex buffer table (PTR_VERTEXBUFFERTABLE) */
@@ -346,12 +390,21 @@ struct VkPs4Pipeline {
     /* Vertex input semantics extracted from VS shader binary */
     GnmVertexInputSemantic vs_input_semantics[VK_PS4_MAX_INPUT_USAGE_SLOTS];
     uint32_t vs_input_semantic_count;
+    /* Pre-computed depth/stencil GNM state (converted from VkPipelineDepthStencilStateCreateInfo) */
+    GnmDepthStencilControl depth_stencil_control;
+    bool has_depth_stencil_state;  /* true if pDepthStencilState was non-NULL */
+    /* Stencil ref/mask register values (pre-computed for CmdBindPipeline) */
+    uint32_t stencil_refmask;      /* DB_STENCILREFMASK (front) */
+    uint32_t stencil_refmask_bf;   /* DB_STENCILREFMASK_BF (back) */
+    uint32_t stencil_control;      /* DB_STENCIL_CONTROL (ops front+back) */
 };
 
 /* === Descriptor === */
 typedef struct {
     VkDescriptorType type;
     uint32_t count;
+    uint32_t binding_number;  /* Vulkan binding number (may be sparse) */
+    bool resources_allocated; /* true once resource arrays are alloc'd */
     /* Resource data — which array is valid depends on type */
     GnmBuffer *buffers;     /* UBO / SSBO / texel buffer */
     GnmTexture *textures;   /* sampled / storage image */
@@ -397,6 +450,14 @@ struct VkPs4QueryPool {
     VkPs4ObjectType type;
     VkPs4Device *device;
     VkQueryPoolCreateInfo create_info;
+    /* GPU-visible memory for query results.
+     * Each query slot stores a uint64_t result.
+     * For occlusion queries: ZPASS count.
+     * For timestamp queries: GPU timestamp value. */
+    GnmDirectMemory gnm_mem;     /* full direct memory handle for release */
+    void *result_buffer;         /* CPU-mapped pointer to result memory */
+    uint64_t result_gpu_addr;    /* GPU address of result memory */
+    VkDeviceSize result_size;    /* total size in bytes */
 };
 
 /* === Swapchain === */
@@ -423,6 +484,8 @@ void vk_ps4_free(const VkAllocationCallbacks *alloc, void *ptr);
 
 /* === Format mapping === */
 GnmDataFormat vk_ps4_vk_format_to_gnm(VkFormat format);
+GnmDataFormat vk_ps4_vk_format_to_gnm_buffer(VkFormat format);
+bool vk_ps4_gnm_format_is_buffer_compatible(GnmDataFormat fmt);
 VkFormatProperties vk_ps4_format_properties(VkFormat format);
 
 /* === Device extension enumeration === */
@@ -448,8 +511,11 @@ VKAPI_ATTR VkResult VKAPI_CALL vk_ps4_EnumeratePhysicalDevices(VkInstance, uint3
 VKAPI_ATTR void VKAPI_CALL vk_ps4_GetPhysicalDeviceProperties(VkPhysicalDevice, VkPhysicalDeviceProperties *);
 VKAPI_ATTR void VKAPI_CALL vk_ps4_GetPhysicalDeviceMemoryProperties(VkPhysicalDevice, VkPhysicalDeviceMemoryProperties *);
 VKAPI_ATTR void VKAPI_CALL vk_ps4_GetPhysicalDeviceQueueFamilyProperties(VkPhysicalDevice, uint32_t *, VkQueueFamilyProperties *);
+VKAPI_ATTR void VKAPI_CALL vk_ps4_GetPhysicalDeviceQueueFamilyProperties2(VkPhysicalDevice, uint32_t *, VkQueueFamilyProperties2 *);
 VKAPI_ATTR void VKAPI_CALL vk_ps4_GetPhysicalDeviceFeatures(VkPhysicalDevice, VkPhysicalDeviceFeatures *);
 VKAPI_ATTR void VKAPI_CALL vk_ps4_GetPhysicalDeviceFormatProperties(VkPhysicalDevice, VkFormat, VkFormatProperties *);
+VKAPI_ATTR void VKAPI_CALL vk_ps4_GetPhysicalDeviceSparseImageFormatProperties(VkPhysicalDevice, VkFormat, VkImageType, VkSampleCountFlagBits, VkImageUsageFlags, VkImageTiling, uint32_t *, VkSparseImageFormatProperties *);
+VKAPI_ATTR VkResult VKAPI_CALL vk_ps4_GetPhysicalDeviceImageFormatProperties(VkPhysicalDevice, VkFormat, VkImageType, VkImageTiling, VkImageUsageFlags, VkImageCreateFlags, VkImageFormatProperties *);
 
 /* Device */
 VKAPI_ATTR VkResult VKAPI_CALL vk_ps4_CreateDevice(VkPhysicalDevice, const VkDeviceCreateInfo *, const VkAllocationCallbacks *, VkDevice *);
@@ -468,15 +534,23 @@ VKAPI_ATTR VkResult VKAPI_CALL vk_ps4_InvalidateMappedMemoryRanges(VkDevice, uin
 VKAPI_ATTR VkResult VKAPI_CALL vk_ps4_CreateBuffer(VkDevice, const VkBufferCreateInfo *, const VkAllocationCallbacks *, VkBuffer *);
 VKAPI_ATTR void VKAPI_CALL vk_ps4_DestroyBuffer(VkDevice, VkBuffer, const VkAllocationCallbacks *);
 VKAPI_ATTR void VKAPI_CALL vk_ps4_GetBufferMemoryRequirements(VkDevice, VkBuffer, VkMemoryRequirements *);
+VKAPI_ATTR void VKAPI_CALL vk_ps4_GetBufferMemoryRequirements2(VkDevice, VkBuffer, VkMemoryRequirements2 *);
 VKAPI_ATTR VkResult VKAPI_CALL vk_ps4_BindBufferMemory(VkDevice, VkBuffer, VkDeviceMemory, VkDeviceSize);
 
 /* Image */
 VKAPI_ATTR VkResult VKAPI_CALL vk_ps4_CreateImage(VkDevice, const VkImageCreateInfo *, const VkAllocationCallbacks *, VkImage *);
 VKAPI_ATTR void VKAPI_CALL vk_ps4_DestroyImage(VkDevice, VkImage, const VkAllocationCallbacks *);
 VKAPI_ATTR void VKAPI_CALL vk_ps4_GetImageMemoryRequirements(VkDevice, VkImage, VkMemoryRequirements *);
+VKAPI_ATTR void VKAPI_CALL vk_ps4_GetImageMemoryRequirements2(VkDevice, VkImage, VkMemoryRequirements2 *);
 VKAPI_ATTR VkResult VKAPI_CALL vk_ps4_BindImageMemory(VkDevice, VkImage, VkDeviceMemory, VkDeviceSize);
 VKAPI_ATTR VkResult VKAPI_CALL vk_ps4_CreateImageView(VkDevice, const VkImageViewCreateInfo *, const VkAllocationCallbacks *, VkImageView *);
 VKAPI_ATTR void VKAPI_CALL vk_ps4_DestroyImageView(VkDevice, VkImageView, const VkAllocationCallbacks *);
+VKAPI_ATTR VkResult VKAPI_CALL vk_ps4_CreateBufferView(VkDevice, const VkBufferViewCreateInfo *, const VkAllocationCallbacks *, VkBufferView *);
+VKAPI_ATTR void VKAPI_CALL vk_ps4_DestroyBufferView(VkDevice, VkBufferView, const VkAllocationCallbacks *);
+
+/* Misc */
+VKAPI_ATTR void VKAPI_CALL vk_ps4_GetRenderAreaGranularity(VkDevice, VkRenderPass, VkExtent2D *);
+VKAPI_ATTR void VKAPI_CALL vk_ps4_GetDeviceMemoryCommitment(VkDevice, VkDeviceMemory, VkDeviceSize *);
 
 /* Render pass / framebuffer */
 VKAPI_ATTR VkResult VKAPI_CALL vk_ps4_CreateRenderPass(VkDevice, const VkRenderPassCreateInfo *, const VkAllocationCallbacks *, VkRenderPass *);
@@ -492,6 +566,12 @@ VKAPI_ATTR void VKAPI_CALL vk_ps4_DestroyPipelineLayout(VkDevice, VkPipelineLayo
 VKAPI_ATTR VkResult VKAPI_CALL vk_ps4_CreateGraphicsPipelines(VkDevice, VkPipelineCache, uint32_t, const VkGraphicsPipelineCreateInfo *, const VkAllocationCallbacks *, VkPipeline *);
 VKAPI_ATTR VkResult VKAPI_CALL vk_ps4_CreateComputePipelines(VkDevice, VkPipelineCache, uint32_t, const VkComputePipelineCreateInfo *, const VkAllocationCallbacks *, VkPipeline *);
 VKAPI_ATTR void VKAPI_CALL vk_ps4_DestroyPipeline(VkDevice, VkPipeline, const VkAllocationCallbacks *);
+
+/* Pipeline cache */
+VKAPI_ATTR VkResult VKAPI_CALL vk_ps4_CreatePipelineCache(VkDevice, const VkPipelineCacheCreateInfo *, const VkAllocationCallbacks *, VkPipelineCache *);
+VKAPI_ATTR void VKAPI_CALL vk_ps4_DestroyPipelineCache(VkDevice, VkPipelineCache, const VkAllocationCallbacks *);
+VKAPI_ATTR VkResult VKAPI_CALL vk_ps4_GetPipelineCacheData(VkDevice, VkPipelineCache, size_t *, void *);
+VKAPI_ATTR VkResult VKAPI_CALL vk_ps4_MergePipelineCaches(VkDevice, VkPipelineCache, uint32_t, const VkPipelineCache *);
 
 /* Descriptor */
 VKAPI_ATTR VkResult VKAPI_CALL vk_ps4_CreateDescriptorSetLayout(VkDevice, const VkDescriptorSetLayoutCreateInfo *, const VkAllocationCallbacks *, VkDescriptorSetLayout *);
@@ -515,6 +595,13 @@ VKAPI_ATTR VkResult VKAPI_CALL vk_ps4_ResetCommandBuffer(VkCommandBuffer, VkComm
 VKAPI_ATTR void VKAPI_CALL vk_ps4_CmdBindPipeline(VkCommandBuffer, VkPipelineBindPoint, VkPipeline);
 VKAPI_ATTR void VKAPI_CALL vk_ps4_CmdSetViewport(VkCommandBuffer, uint32_t, uint32_t, const VkViewport *);
 VKAPI_ATTR void VKAPI_CALL vk_ps4_CmdSetScissor(VkCommandBuffer, uint32_t, uint32_t, const VkRect2D *);
+VKAPI_ATTR void VKAPI_CALL vk_ps4_CmdSetLineWidth(VkCommandBuffer, float);
+VKAPI_ATTR void VKAPI_CALL vk_ps4_CmdSetDepthBias(VkCommandBuffer, float, float, float);
+VKAPI_ATTR void VKAPI_CALL vk_ps4_CmdSetBlendConstants(VkCommandBuffer, const float[4]);
+VKAPI_ATTR void VKAPI_CALL vk_ps4_CmdSetDepthBounds(VkCommandBuffer, float, float);
+VKAPI_ATTR void VKAPI_CALL vk_ps4_CmdSetStencilCompareMask(VkCommandBuffer, VkStencilFaceFlags, uint32_t);
+VKAPI_ATTR void VKAPI_CALL vk_ps4_CmdSetStencilWriteMask(VkCommandBuffer, VkStencilFaceFlags, uint32_t);
+VKAPI_ATTR void VKAPI_CALL vk_ps4_CmdSetStencilReference(VkCommandBuffer, VkStencilFaceFlags, uint32_t);
 VKAPI_ATTR void VKAPI_CALL vk_ps4_CmdBindDescriptorSets(VkCommandBuffer, VkPipelineBindPoint, VkPipelineLayout, uint32_t, uint32_t, const VkDescriptorSet *, uint32_t, const uint32_t *);
 VKAPI_ATTR void VKAPI_CALL vk_ps4_CmdBindVertexBuffers(VkCommandBuffer, uint32_t, uint32_t, const VkBuffer *, const VkDeviceSize *);
 VKAPI_ATTR void VKAPI_CALL vk_ps4_CmdBindIndexBuffer(VkCommandBuffer, VkBuffer, VkDeviceSize, VkIndexType);
@@ -523,18 +610,27 @@ VKAPI_ATTR void VKAPI_CALL vk_ps4_CmdDrawIndexed(VkCommandBuffer, uint32_t, uint
 VKAPI_ATTR void VKAPI_CALL vk_ps4_CmdDrawIndirect(VkCommandBuffer, VkBuffer, VkDeviceSize, uint32_t, uint32_t);
 VKAPI_ATTR void VKAPI_CALL vk_ps4_CmdDrawIndexedIndirect(VkCommandBuffer, VkBuffer, VkDeviceSize, uint32_t, uint32_t);
 VKAPI_ATTR void VKAPI_CALL vk_ps4_CmdDispatch(VkCommandBuffer, uint32_t, uint32_t, uint32_t);
+VKAPI_ATTR void VKAPI_CALL vk_ps4_CmdDispatchIndirect(VkCommandBuffer, VkBuffer, VkDeviceSize);
 VKAPI_ATTR void VKAPI_CALL vk_ps4_CmdCopyBuffer(VkCommandBuffer, VkBuffer, VkBuffer, uint32_t, const VkBufferCopy *);
+VKAPI_ATTR void VKAPI_CALL vk_ps4_CmdFillBuffer(VkCommandBuffer, VkBuffer, VkDeviceSize, VkDeviceSize, uint32_t);
+VKAPI_ATTR void VKAPI_CALL vk_ps4_CmdUpdateBuffer(VkCommandBuffer, VkBuffer, VkDeviceSize, VkDeviceSize, const void *);
 VKAPI_ATTR void VKAPI_CALL vk_ps4_CmdCopyImage(VkCommandBuffer, VkImage, VkImageLayout, VkImage, VkImageLayout, uint32_t, const VkImageCopy *);
 VKAPI_ATTR void VKAPI_CALL vk_ps4_CmdBlitImage(VkCommandBuffer, VkImage, VkImageLayout, VkImage, VkImageLayout, uint32_t, const VkImageBlit *, VkFilter);
+VKAPI_ATTR void VKAPI_CALL vk_ps4_CmdResolveImage(VkCommandBuffer, VkImage, VkImageLayout, VkImage, VkImageLayout, uint32_t, const VkImageResolve *);
 VKAPI_ATTR void VKAPI_CALL vk_ps4_CmdCopyBufferToImage(VkCommandBuffer, VkBuffer, VkImage, VkImageLayout, uint32_t, const VkBufferImageCopy *);
 VKAPI_ATTR void VKAPI_CALL vk_ps4_CmdCopyImageToBuffer(VkCommandBuffer, VkImage, VkImageLayout, VkBuffer, uint32_t, const VkBufferImageCopy *);
 VKAPI_ATTR void VKAPI_CALL vk_ps4_CmdBeginRenderPass(VkCommandBuffer, const VkRenderPassBeginInfo *, VkSubpassContents);
+VKAPI_ATTR void VKAPI_CALL vk_ps4_CmdNextSubpass(VkCommandBuffer, VkSubpassContents);
 VKAPI_ATTR void VKAPI_CALL vk_ps4_CmdEndRenderPass(VkCommandBuffer);
 VKAPI_ATTR void VKAPI_CALL vk_ps4_CmdPipelineBarrier(VkCommandBuffer, VkPipelineStageFlags, VkPipelineStageFlags, VkDependencyFlags, uint32_t, const VkMemoryBarrier *, uint32_t, const VkBufferMemoryBarrier *, uint32_t, const VkImageMemoryBarrier *);
+VKAPI_ATTR void VKAPI_CALL vk_ps4_CmdSetEvent(VkCommandBuffer, VkEvent, VkPipelineStageFlags);
+VKAPI_ATTR void VKAPI_CALL vk_ps4_CmdResetEvent(VkCommandBuffer, VkEvent, VkPipelineStageFlags);
+VKAPI_ATTR void VKAPI_CALL vk_ps4_CmdWaitEvents(VkCommandBuffer, uint32_t, const VkEvent *, VkPipelineStageFlags, VkPipelineStageFlags, uint32_t, const VkMemoryBarrier *, uint32_t, const VkBufferMemoryBarrier *, uint32_t, const VkImageMemoryBarrier *);
 VKAPI_ATTR void VKAPI_CALL vk_ps4_CmdClearColorImage(VkCommandBuffer, VkImage, VkImageLayout, const VkClearColorValue *, uint32_t, const VkImageSubresourceRange *);
 VKAPI_ATTR void VKAPI_CALL vk_ps4_CmdClearDepthStencilImage(VkCommandBuffer, VkImage, VkImageLayout, const VkClearDepthStencilValue *, uint32_t, const VkImageSubresourceRange *);
 VKAPI_ATTR void VKAPI_CALL vk_ps4_CmdClearAttachments(VkCommandBuffer, uint32_t, const VkClearAttachment *, uint32_t, const VkClearRect *);
 VKAPI_ATTR void VKAPI_CALL vk_ps4_CmdPushConstants(VkCommandBuffer, VkPipelineLayout, VkShaderStageFlags, uint32_t, uint32_t, const void *);
+VKAPI_ATTR void VKAPI_CALL vk_ps4_CmdExecuteCommands(VkCommandBuffer, uint32_t, const VkCommandBuffer *);
 
 /* Queue */
 VKAPI_ATTR VkResult VKAPI_CALL vk_ps4_QueueSubmit(VkQueue, uint32_t, const VkSubmitInfo *, VkFence);
@@ -563,6 +659,7 @@ VKAPI_ATTR void VKAPI_CALL vk_ps4_CmdResetQueryPool(VkCommandBuffer, VkQueryPool
 VKAPI_ATTR void VKAPI_CALL vk_ps4_CmdBeginQuery(VkCommandBuffer, VkQueryPool, uint32_t, VkQueryControlFlags);
 VKAPI_ATTR void VKAPI_CALL vk_ps4_CmdEndQuery(VkCommandBuffer, VkQueryPool, uint32_t);
 VKAPI_ATTR void VKAPI_CALL vk_ps4_CmdWriteTimestamp(VkCommandBuffer, VkPipelineStageFlagBits, VkQueryPool, uint32_t);
+VKAPI_ATTR void VKAPI_CALL vk_ps4_CmdCopyQueryPoolResults(VkCommandBuffer, VkQueryPool, uint32_t, uint32_t, VkBuffer, VkDeviceSize, VkDeviceSize, VkQueryResultFlags);
 
 /* Swapchain */
 VKAPI_ATTR VkResult VKAPI_CALL vk_ps4_CreateSwapchainKHR(VkDevice, const VkSwapchainCreateInfoKHR *, const VkAllocationCallbacks *, VkSwapchainKHR *);
