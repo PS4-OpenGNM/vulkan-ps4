@@ -295,6 +295,10 @@ struct VkPs4PipelineLayout {
     uint32_t push_constant_range_count;
 };
 
+/* === Descriptor / pipeline limits === */
+#define VK_PS4_MAX_DESCRIPTOR_BINDINGS 64
+#define VK_PS4_MAX_INPUT_USAGE_SLOTS 32
+
 /* === Pipeline === */
 struct VkPs4Pipeline {
     VkPs4ObjectType type;
@@ -323,9 +327,25 @@ struct VkPs4Pipeline {
     void *fetch_shader;
     size_t fetch_shader_size;
     bool has_fetch_shader;
+    /* Input usage slot tables extracted from compiled shader binaries.
+     * These map Vulkan binding numbers (apislot) to GNM user-data
+     * registers (startregister) for each shader stage. */
+    GnmInputUsageSlot vs_input_usage_slots[VK_PS4_MAX_INPUT_USAGE_SLOTS];
+    uint32_t vs_input_usage_slot_count;
+    GnmInputUsageSlot ps_input_usage_slots[VK_PS4_MAX_INPUT_USAGE_SLOTS];
+    uint32_t ps_input_usage_slot_count;
 };
 
 /* === Descriptor === */
+typedef struct {
+    VkDescriptorType type;
+    uint32_t count;
+    /* Resource data — which array is valid depends on type */
+    GnmBuffer *buffers;     /* UBO / SSBO / texel buffer */
+    GnmTexture *textures;   /* sampled / storage image */
+    GnmSampler *samplers;   /* sampler (incl. combined image sampler) */
+} VkPs4DescriptorBinding;
+
 struct VkPs4DescriptorPool {
     VkPs4ObjectType type;
     VkPs4Device *device;
@@ -337,6 +357,8 @@ struct VkPs4DescriptorSet {
     VkPs4Device *device;
     VkPs4DescriptorPool *pool;
     VkPs4DescriptorSetLayout *layout;
+    VkPs4DescriptorBinding bindings[VK_PS4_MAX_DESCRIPTOR_BINDINGS];
+    uint32_t binding_count;
 };
 
 /* === Sync === */

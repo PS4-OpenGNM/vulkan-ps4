@@ -278,22 +278,7 @@ vk_ps4_CmdSetScissor(VkCommandBuffer commandBuffer, uint32_t firstScissor, uint3
     }
 }
 
-VKAPI_ATTR void VKAPI_CALL
-vk_ps4_CmdBindDescriptorSets(VkCommandBuffer commandBuffer, VkPipelineBindPoint pipelineBindPoint,
-                              VkPipelineLayout layout, uint32_t firstSet, uint32_t descriptorSetCount,
-                              const VkDescriptorSet *pDescriptorSets, uint32_t dynamicOffsetCount,
-                              const uint32_t *pDynamicOffsets) {
-    /* Phase 2: descriptor set binding via user data registers.
-     * For Phase 1 (no descriptors), this is a no-op. */
-    (void)commandBuffer;
-    (void)pipelineBindPoint;
-    (void)layout;
-    (void)firstSet;
-    (void)descriptorSetCount;
-    (void)pDescriptorSets;
-    (void)dynamicOffsetCount;
-    (void)pDynamicOffsets;
-}
+/* CmdBindDescriptorSets moved to vk_ps4_descriptor.c */
 
 VKAPI_ATTR void VKAPI_CALL
 vk_ps4_CmdBindVertexBuffers(VkCommandBuffer commandBuffer, uint32_t firstBinding,

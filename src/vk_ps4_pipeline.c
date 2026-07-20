@@ -106,14 +106,23 @@ vk_ps4_CreateGraphicsPipelines(VkDevice device, VkPipelineCache pipelineCache,
                 break;
             }
 
-            /* Extract stage registers from the compiled shader binary */
+            /* Extract stage registers and input usage slots from the compiled shader binary */
             if (metadata.fileheader && metadata.stage) {
+                /* Extract input usage slots (shared across all stages in the binary) */
+                uint32_t nslots = metadata.numinputusageslots;
+                if (nslots > VK_PS4_MAX_INPUT_USAGE_SLOTS) nslots = VK_PS4_MAX_INPUT_USAGE_SLOTS;
+                const GnmInputUsageSlot *slots = metadata.inputusageslots;
+
                 switch (stage->stage) {
                 case VK_SHADER_STAGE_VERTEX_BIT: {
                     const GnmVsShader *vs = (const GnmVsShader *)metadata.stage;
                     pipe->vs_regs = vs->registers;
                     pipe->vs_module = mod;
                     vs_found = true;
+                    if (slots && nslots > 0) {
+                        memcpy(pipe->vs_input_usage_slots, slots, nslots * sizeof(GnmInputUsageSlot));
+                        pipe->vs_input_usage_slot_count = nslots;
+                    }
                     break;
                 }
                 case VK_SHADER_STAGE_FRAGMENT_BIT: {
@@ -121,6 +130,10 @@ vk_ps4_CreateGraphicsPipelines(VkDevice device, VkPipelineCache pipelineCache,
                     pipe->ps_regs = ps->registers;
                     pipe->fs_module = mod;
                     ps_found = true;
+                    if (slots && nslots > 0) {
+                        memcpy(pipe->ps_input_usage_slots, slots, nslots * sizeof(GnmInputUsageSlot));
+                        pipe->ps_input_usage_slot_count = nslots;
+                    }
                     break;
                 }
                 case VK_SHADER_STAGE_GEOMETRY_BIT:
@@ -405,6 +418,20 @@ vk_ps4_AllocateDescriptorSets(VkDevice device, const VkDescriptorSetAllocateInfo
         set->device = dev;
         set->pool = (VkPs4DescriptorPool *)pAllocateInfo->descriptorPool;
         set->layout = (VkPs4DescriptorSetLayout *)pAllocateInfo->pSetLayouts[i];
+
+        /* Initialize bindings from the layout */
+        if (set->layout && set->layout->binding_count <= VK_PS4_MAX_DESCRIPTOR_BINDINGS) {
+            set->binding_count = set->layout->binding_count;
+            for (uint32_t b = 0; b < set->binding_count; b++) {
+                set->bindings[b].type = set->layout->bindings[b].descriptorType;
+                set->bindings[b].count = set->layout->bindings[b].descriptorCount;
+                set->bindings[b].buffers = NULL;
+                set->bindings[b].textures = NULL;
+                set->bindings[b].samplers = NULL;
+                /* Resource arrays are allocated lazily in UpdateDescriptorSets */
+            }
+        }
+
         pDescriptorSets[i] = (VkDescriptorSet)set;
     }
     return VK_SUCCESS;
@@ -419,25 +446,20 @@ vk_ps4_FreeDescriptorSets(VkDevice device, VkDescriptorPool descriptorPool,
     const VkAllocationCallbacks *alloc = &dev->allocator;
     for (uint32_t i = 0; i < descriptorSetCount; i++) {
         if (pDescriptorSets[i]) {
-            vk_ps4_free(alloc, (void *)pDescriptorSets[i]);
+            VkPs4DescriptorSet *set = (VkPs4DescriptorSet *)pDescriptorSets[i];
+            /* Free binding resource arrays */
+            for (uint32_t b = 0; b < set->binding_count; b++) {
+                if (set->bindings[b].buffers) vk_ps4_free(alloc, set->bindings[b].buffers);
+                if (set->bindings[b].textures) vk_ps4_free(alloc, set->bindings[b].textures);
+                if (set->bindings[b].samplers) vk_ps4_free(alloc, set->bindings[b].samplers);
+            }
+            vk_ps4_free(alloc, set);
         }
     }
     return VK_SUCCESS;
 }
 
-VKAPI_ATTR void VKAPI_CALL
-vk_ps4_UpdateDescriptorSets(VkDevice device, uint32_t descriptorWriteCount,
-                            const VkWriteDescriptorSet *pDescriptorWrites,
-                            uint32_t descriptorCopyCount,
-                            const VkCopyDescriptorSet *pDescriptorCopies) {
-    /* Phase 2: full descriptor update. For Phase 1 (triangle with no descriptors),
-     * this is a no-op. */
-    (void)device;
-    (void)descriptorWriteCount;
-    (void)pDescriptorWrites;
-    (void)descriptorCopyCount;
-    (void)pDescriptorCopies;
-}
+/* UpdateDescriptorSets moved to vk_ps4_descriptor.c */
 
 VKAPI_ATTR VkResult VKAPI_CALL
 vk_ps4_ResetDescriptorPool(VkDevice device, VkDescriptorPool descriptorPool, VkDescriptorPoolResetFlags flags) {
@@ -448,33 +470,4 @@ vk_ps4_ResetDescriptorPool(VkDevice device, VkDescriptorPool descriptorPool, VkD
 }
 
 /* === Sampler === */
-
-VKAPI_ATTR VkResult VKAPI_CALL
-vk_ps4_CreateSampler(VkDevice device, const VkSamplerCreateInfo *pCreateInfo,
-                     const VkAllocationCallbacks *pAllocator, VkSampler *pSampler) {
-    if (!device || !pCreateInfo || !pSampler) {
-        return VK_ERROR_INITIALIZATION_FAILED;
-    }
-    VkPs4Device *dev = (VkPs4Device *)device;
-    const VkAllocationCallbacks *alloc = pAllocator ? pAllocator : &dev->allocator;
-
-    GnmSampler *sampler = vk_ps4_alloc_zero(alloc, sizeof(*sampler), 16);
-    if (!sampler) return VK_ERROR_OUT_OF_HOST_MEMORY;
-
-    /* Map Vulkan sampler state to GnmSampler fields.
-     * This is a simplified mapping — full mapping is Phase 2. */
-    memset(sampler, 0, sizeof(*sampler));
-
-    /* TODO: full sampler state mapping */
-
-    *pSampler = (VkSampler)sampler;
-    return VK_SUCCESS;
-}
-
-VKAPI_ATTR void VKAPI_CALL
-vk_ps4_DestroySampler(VkDevice device, VkSampler sampler, const VkAllocationCallbacks *pAllocator) {
-    if (!device || !sampler) return;
-    VkPs4Device *dev = (VkPs4Device *)device;
-    const VkAllocationCallbacks *alloc = pAllocator ? pAllocator : &dev->allocator;
-    vk_ps4_free(alloc, (void *)sampler);
-}
+/* (Moved to vk_ps4_descriptor.c for proper GnmSampler initialization) */

@@ -85,6 +85,7 @@ set(VK_PS4_SOURCES
     src/vk_ps4_render_pass.c
     src/vk_ps4_shader.c
     src/vk_ps4_pipeline.c
+    src/vk_ps4_descriptor.c
     src/vk_ps4_command.c
     src/vk_ps4_swapchain.c
     src/vk_ps4_queue.c
@@ -151,6 +152,12 @@ if(NOT VK_PS4_ORBIS)
     add_executable(vk_ps4_triangle_test tests/test_triangle.c)
     target_link_libraries(vk_ps4_triangle_test PRIVATE vulkan_ps4)
     add_test(NAME triangle_test COMMAND vk_ps4_triangle_test
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
+    # Phase 2 descriptor test — exercises descriptor sets, samplers, updates
+    add_executable(vk_ps4_descriptor_test tests/test_descriptor.c)
+    target_link_libraries(vk_ps4_descriptor_test PRIVATE vulkan_ps4)
+    add_test(NAME descriptor_test COMMAND vk_ps4_descriptor_test
         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 endif()
 
