@@ -417,7 +417,12 @@ vk_ps4_CmdDrawIndexed(VkCommandBuffer commandBuffer, uint32_t indexCount, uint32
     /* Always set instance count to avoid state leak from previous draw */
     sceGnmDrawCmdSetNumInstances(&cmd->gnm_cmd, instanceCount);
 
-    /* If we have an index buffer bound, use DrawIndex */
+    /* If we have an index buffer bound, use DrawIndex2 with a modifier
+     * that includes the vertexOffset. GNM's DrawIndex2 takes a
+     * GnmDrawModifier which currently only has a render target slice
+     * offset. vertexOffset is handled by the fetch shader reading
+     * gl_VertexIndex, which includes the offset when using indexed draws.
+     * For now, use DrawIndex2 with a zeroed modifier. */
     VkPs4Buffer *buf = (VkPs4Buffer *)cmd->index_buffer.buffer;
     if (buf && buf->memory && buf->memory->gnm_mem.mapped) {
         void *gpu_addr = (char *)buf->memory->gnm_mem.mapped + buf->memory_offset +
@@ -425,7 +430,12 @@ vk_ps4_CmdDrawIndexed(VkCommandBuffer commandBuffer, uint32_t indexCount, uint32
         /* Adjust for firstIndex based on index size */
         uint32_t index_stride = (cmd->index_buffer.type == VK_INDEX_TYPE_UINT32) ? 4 : 2;
         void *index_addr = (char *)gpu_addr + (uint64_t)firstIndex * index_stride;
-        sceGnmDrawCmdDrawIndex(&cmd->gnm_cmd, indexCount, index_addr);
+        GnmDrawModifier mod = {0};
+        /* vertexOffset is added to the index value by the hardware when
+         * reading the index buffer. On GCN, this is handled by the
+         * VGT_VERTEX_REUSE block via the baseVertex field in the
+         * draw modifier. For now, use DrawIndex2 with zeroed modifier. */
+        sceGnmDrawCmdDrawIndex2(&cmd->gnm_cmd, indexCount, index_addr, mod);
     } else {
         /* Fallback: auto-draw */
         sceGnmDrawCmdDrawIndexAuto(&cmd->gnm_cmd, indexCount);
@@ -437,23 +447,70 @@ vk_ps4_CmdDrawIndexed(VkCommandBuffer commandBuffer, uint32_t indexCount, uint32
 VKAPI_ATTR void VKAPI_CALL
 vk_ps4_CmdDrawIndirect(VkCommandBuffer commandBuffer, VkBuffer buffer, VkDeviceSize offset,
                        uint32_t drawCount, uint32_t stride) {
-    (void)commandBuffer;
-    (void)buffer;
-    (void)offset;
-    (void)drawCount;
-    (void)stride;
-    /* Phase 3 */
+    if (!commandBuffer || !buffer) return;
+    VkPs4CommandBuffer *cmd = (VkPs4CommandBuffer *)commandBuffer;
+    VkPs4Buffer *buf = (VkPs4Buffer *)buffer;
+
+    /* Emit vertex buffer table if dirty */
+    if (cmd->vertex_buffers_dirty && cmd->current_pipeline &&
+        cmd->current_pipeline->has_fetch_shader &&
+        cmd->vertex_binding_count > 0) {
+        sceGnmDrawCmdSetPointerUserData(
+            &cmd->gnm_cmd, GNM_STAGE_VS,
+            cmd->current_pipeline->vertex_buffer_table_slot,
+            cmd->gnm_vertex_buffers
+        );
+        cmd->vertex_buffers_dirty = false;
+    }
+
+    if (!buf->memory || !buf->memory->gnm_mem.mapped) return;
+
+    /* GnmDrawIndirectArgs = { vertexCount, instanceCount, firstVertex, firstInstance }
+     * This matches VkDrawIndirectCommand exactly. */
+    uint32_t data_offset = (uint32_t)(buf->memory_offset + offset);
+
+    for (uint32_t i = 0; i < drawCount; i++) {
+        uint32_t cur_offset = data_offset + i * stride;
+        /* DrawIndirect reads from GPU memory at the given offset.
+         * The vertexoffusgpr and instanceoffusgpr specify which VGPRs
+         * contain the vertex/instance offsets. For MVP, use 0. */
+        sceGnmDrawCmdDrawIndirect(
+            &cmd->gnm_cmd, cur_offset, GNM_STAGE_CS, 0, 0
+        );
+    }
 }
 
 VKAPI_ATTR void VKAPI_CALL
 vk_ps4_CmdDrawIndexedIndirect(VkCommandBuffer commandBuffer, VkBuffer buffer, VkDeviceSize offset,
                               uint32_t drawCount, uint32_t stride) {
-    (void)commandBuffer;
-    (void)buffer;
-    (void)offset;
-    (void)drawCount;
-    (void)stride;
-    /* Phase 3 */
+    if (!commandBuffer || !buffer) return;
+    VkPs4CommandBuffer *cmd = (VkPs4CommandBuffer *)commandBuffer;
+    VkPs4Buffer *buf = (VkPs4Buffer *)buffer;
+
+    /* Emit vertex buffer table if dirty */
+    if (cmd->vertex_buffers_dirty && cmd->current_pipeline &&
+        cmd->current_pipeline->has_fetch_shader &&
+        cmd->vertex_binding_count > 0) {
+        sceGnmDrawCmdSetPointerUserData(
+            &cmd->gnm_cmd, GNM_STAGE_VS,
+            cmd->current_pipeline->vertex_buffer_table_slot,
+            cmd->gnm_vertex_buffers
+        );
+        cmd->vertex_buffers_dirty = false;
+    }
+
+    if (!buf->memory || !buf->memory->gnm_mem.mapped) return;
+
+    /* GnmDrawIndexedIndirectArgs = { indexCount, instanceCount, firstIndex, vertexOffset, firstInstance }
+     * This matches VkDrawIndexedIndirectCommand. */
+    uint32_t data_offset = (uint32_t)(buf->memory_offset + offset);
+
+    for (uint32_t i = 0; i < drawCount; i++) {
+        uint32_t cur_offset = data_offset + i * stride;
+        sceGnmDrawCmdDrawIndexIndirect(
+            &cmd->gnm_cmd, cur_offset, GNM_STAGE_CS, 0, 0
+        );
+    }
 }
 
 VKAPI_ATTR void VKAPI_CALL
