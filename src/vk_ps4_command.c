@@ -106,6 +106,64 @@ static inline uint32_t vk_ps4_fui(float f) {
     return v.u;
 }
 
+/* Convert float32 to float16 (IEEE 754 half precision).
+ * Implements the standard round-to-nearest-even conversion. */
+static inline uint16_t vk_ps4_float_to_half(float f) {
+    union { float f; uint32_t u; } v;
+    v.f = f;
+    uint32_t x = v.u;
+    uint32_t sign = (x >> 31) & 1;
+    uint32_t exp = (x >> 23) & 0xFF;
+    uint32_t mant = x & 0x7FFFFF;
+
+    if (exp == 0xFF) {
+        /* Inf or NaN → half Inf/NaN */
+        if (mant == 0) {
+            return (uint16_t)((sign << 15) | 0x7C00);
+        } else {
+            /* NaN: preserve mantissa bits, set at least one */
+            return (uint16_t)((sign << 15) | 0x7C00 | (mant >> 13) | 1);
+        }
+    }
+
+    /* Bias adjust: 127 → 15 */
+    int32_t new_exp = (int32_t)exp - 127 + 15;
+
+    if (new_exp <= 0) {
+        /* Underflow to denormal or zero */
+        if (new_exp < -10) {
+            /* Too small → zero */
+            return (uint16_t)(sign << 15);
+        }
+        /* Denormal: shift mantissa by (14 - new_exp) bits with rounding */
+        mant = mant | 0x800000;  /* implicit 1 */
+        uint32_t shift = (uint32_t)(14 - new_exp);
+        uint32_t result_mant = mant >> shift;
+        /* Round-to-nearest-even */
+        uint32_t round_bit = (mant >> (shift - 1)) & 1;
+        uint32_t sticky = (shift > 1) ? ((mant & ((1U << (shift - 1)) - 1)) != 0) : 0;
+        if (round_bit && (sticky || (result_mant & 1))) {
+            result_mant++;
+        }
+        return (uint16_t)((sign << 15) | result_mant);
+    }
+
+    if (new_exp >= 0x1F) {
+        /* Overflow → half Inf */
+        return (uint16_t)((sign << 15) | 0x7C00);
+    }
+
+    /* Normal: pack sign, exponent, mantissa with rounding */
+    uint32_t result = (sign << 15) | ((uint32_t)new_exp << 10) | (mant >> 13);
+    /* Round-to-nearest-even based on truncated bits */
+    uint32_t round_bit = (mant >> 12) & 1;
+    uint32_t sticky = (mant & 0xFFF) != 0;
+    if (round_bit && (sticky || (result & 1))) {
+        result++;
+    }
+    return (uint16_t)result;
+}
+
 /* Pack a VkClearColorValue into a 32-bit FillMemory value based on the format.
  * FillMemory writes 32-bit values to 4-byte-aligned addresses, so for
  * formats smaller than 32 bpp, the clear value is replicated to fill
@@ -155,17 +213,31 @@ static uint32_t vk_ps4_pack_clear_val_32(VkFormat fmt, const VkClearColorValue *
         return (uint32_t)v | ((uint32_t)v << 8) |
                ((uint32_t)v << 16) | ((uint32_t)v << 24);
     }
-    case VK_FORMAT_R16_SFLOAT:
-    case VK_FORMAT_R16_UNORM: {
-        /* 16-bit: replicate 2 times. For float16, pack as half. */
-        /* For simplicity, use the raw uint32[0] for UNORM, or fui for float */
-        uint16_t h = (uint16_t)cc->uint32[0];
+    case VK_FORMAT_R16_SFLOAT: {
+        /* 16-bit float: convert float32 → float16 (IEEE 754 half). */
+        uint16_t h = vk_ps4_float_to_half(cc->float32[0]);
         return (uint32_t)h | ((uint32_t)h << 16);
     }
-    case VK_FORMAT_R16G16_SFLOAT:
-    case VK_FORMAT_R16G16_UNORM:
-    case VK_FORMAT_R16G16_UINT: {
-        /* 32-bit = two 16-bit values */
+    case VK_FORMAT_R16_UNORM: {
+        /* 16-bit UNORM: convert float [0,1] → uint16 [0,65535]. */
+        uint16_t h = (uint16_t)(cc->float32[0] * 65535.0f + 0.5f);
+        return (uint32_t)h | ((uint32_t)h << 16);
+    }
+    case VK_FORMAT_R16G16_SFLOAT: {
+        /* 32-bit = two float16 values */
+        uint16_t r = vk_ps4_float_to_half(cc->float32[0]);
+        uint16_t g = vk_ps4_float_to_half(cc->float32[1]);
+        return (uint32_t)r | ((uint32_t)g << 16);
+    }
+    case VK_FORMAT_R16G16_UNORM: {
+        /* 32-bit = two uint16 UNORM values */
+        uint16_t r = (uint16_t)(cc->float32[0] * 65535.0f + 0.5f);
+        uint16_t g = (uint16_t)(cc->float32[1] * 65535.0f + 0.5f);
+        return (uint32_t)r | ((uint32_t)g << 16);
+    }
+    case VK_FORMAT_R16G16_UINT:
+    case VK_FORMAT_R16G16_SINT: {
+        /* 32-bit = two 16-bit integer values */
         uint16_t r = (uint16_t)cc->uint32[0];
         uint16_t g = (uint16_t)cc->uint32[1];
         return (uint32_t)r | ((uint32_t)g << 16);
@@ -284,8 +356,11 @@ static void vk_ps4_clear_depth_draw(GnmCommandBuffer *cmd) {
     sceGnmDrawCmdSetEmbeddedVsShader(cmd, GNM_EMBEDDED_VSH_FULLSCREEN, 0);
     sceGnmDrawCmdSetEmbeddedPsShader(cmd, GNM_EMBEDDED_PSH_DUMMY);
 
-    /* Draw a fullscreen triangle to trigger the lazy clear */
+    /* Draw a fullscreen triangle to trigger the lazy clear.
+     * Reset instance count to 1 — VGT_INSTANCE_COUNT is sticky and may
+     * have been set to a large value by a previous draw. */
     sceGnmDrawCmdSetPrimitiveType(cmd, GNM_PT_TRILIST);
+    sceGnmDrawCmdSetNumInstances(cmd, 1);
     sceGnmDrawCmdDrawIndexAuto(cmd, 3);
 }
 
@@ -369,6 +444,11 @@ static void vk_ps4_rebind_pipeline_state(VkPs4CommandBuffer *cmd) {
     /* Re-emit VS (or LS/ES for tess/GS paths) */
     if (pipe->has_ls) {
         sceGnmDrawCmdSetLsShader(&cmd->gnm_cmd, &pipe->ls_regs, 0);
+        if (pipe->has_ds_vs) {
+            sceGnmDrawCmdSetVsShader(&cmd->gnm_cmd, &pipe->vs_regs, 0);
+        }
+    } else if (pipe->has_es && pipe->has_gs) {
+        /* GS-only: ES is set in the has_gs block below */
     } else if (pipe->has_es && !pipe->has_gs) {
         sceGnmDrawCmdSetEsShader(&cmd->gnm_cmd, &pipe->es_regs, 0);
     } else {
@@ -377,7 +457,12 @@ static void vk_ps4_rebind_pipeline_state(VkPs4CommandBuffer *cmd) {
 
     /* Re-emit HS if present */
     if (pipe->has_hs) {
-        sceGnmDrawCmdSetHsShader(&cmd->gnm_cmd, &pipe->hs_regs, 0);
+        uint32_t cp = pipe->tess_patch_control_points;
+        if (cp > 32) cp = 32;
+        if (cp == 0) cp = 3;
+        uint32_t lshsconfig = S_028B58_HS_NUM_INPUT_CP(cp) |
+                               S_028B58_HS_NUM_OUTPUT_CP(cp);
+        sceGnmDrawCmdSetHsShader(&cmd->gnm_cmd, &pipe->hs_regs, lshsconfig);
     }
 
     /* Re-emit GS if present */
@@ -584,10 +669,14 @@ vk_ps4_AllocateCommandBuffers(VkDevice device, const VkCommandBufferAllocateInfo
     for (uint32_t i = 0; i < pAllocateInfo->commandBufferCount; i++) {
         VkPs4CommandBuffer *cmd = vk_ps4_alloc_zero(alloc, sizeof(*cmd), 16);
         if (!cmd) {
+            /* Per Vulkan spec: on failure, all pCommandBuffers must be VK_NULL_HANDLE */
             for (uint32_t j = 0; j < i; j++) {
                 VkPs4CommandBuffer *c = (VkPs4CommandBuffer *)pCommandBuffers[j];
-                if (c->pm4_buffer) vk_ps4_free(alloc, c->pm4_buffer);
-                vk_ps4_free(alloc, c);
+                if (c) {
+                    if (c->pm4_buffer) vk_ps4_free(alloc, c->pm4_buffer);
+                    vk_ps4_free(alloc, c);
+                }
+                pCommandBuffers[j] = VK_NULL_HANDLE;
             }
             return VK_ERROR_OUT_OF_HOST_MEMORY;
         }
@@ -607,8 +696,11 @@ vk_ps4_AllocateCommandBuffers(VkDevice device, const VkCommandBufferAllocateInfo
             vk_ps4_free(alloc, cmd);
             for (uint32_t j = 0; j < i; j++) {
                 VkPs4CommandBuffer *c = (VkPs4CommandBuffer *)pCommandBuffers[j];
-                if (c->pm4_buffer) vk_ps4_free(alloc, c->pm4_buffer);
-                vk_ps4_free(alloc, c);
+                if (c) {
+                    if (c->pm4_buffer) vk_ps4_free(alloc, c->pm4_buffer);
+                    vk_ps4_free(alloc, c);
+                }
+                pCommandBuffers[j] = VK_NULL_HANDLE;
             }
             return VK_ERROR_OUT_OF_HOST_MEMORY;
         }
@@ -620,11 +712,24 @@ vk_ps4_AllocateCommandBuffers(VkDevice device, const VkCommandBufferAllocateInfo
                 pool->command_buffers[pool->command_buffer_count++] = cmd;
             } else {
                 /* Pool full — free this command buffer and fail.
-                 * Previously allocated buffers in this call are already
-                 * registered in the pool, so we must NOT free them here
-                 * (DestroyCommandPool will handle that). Just fail. */
+                 * Null all previously-allocated handles in this call. */
                 vk_ps4_free(alloc, cmd->pm4_buffer);
                 vk_ps4_free(alloc, cmd);
+                for (uint32_t j = 0; j < i; j++) {
+                    VkPs4CommandBuffer *c = (VkPs4CommandBuffer *)pCommandBuffers[j];
+                    if (c) {
+                        /* Remove from pool to avoid double-free in DestroyCommandPool */
+                        for (uint32_t k = 0; k < pool->command_buffer_count; k++) {
+                            if (pool->command_buffers[k] == c) {
+                                pool->command_buffers[k] = NULL;
+                                break;
+                            }
+                        }
+                        if (c->pm4_buffer) vk_ps4_free(alloc, c->pm4_buffer);
+                        vk_ps4_free(alloc, c);
+                    }
+                    pCommandBuffers[j] = VK_NULL_HANDLE;
+                }
                 return VK_ERROR_OUT_OF_HOST_MEMORY;
             }
         }
@@ -772,25 +877,44 @@ vk_ps4_CmdBindPipeline(VkCommandBuffer commandBuffer, VkPipelineBindPoint pipeli
         sceGnmDrawCmdSetPrimitiveType(&cmd->gnm_cmd,
             vk_topology_to_gnm(pipe->input_assembly_state.topology));
 
-        /* Set vertex shader (or LS/ES if tessellation/geometry is active) */
+        /* Set vertex shader (or LS/ES if tessellation/geometry is active).
+         * On GCN, the post-tessellation vertex stage (domain shader / TES
+         * compiled as DS_VS) runs on the VS hardware, so SetVsShader must
+         * be called for the TES registers when tessellation is active. */
         if (pipe->has_ls) {
             /* Tessellation path: VS is compiled as LS (local shader).
-             * SetLsShader sets the LS stage, and the HS will use it. */
+             * SetLsShader sets the LS stage (pre-tessellation vertex). */
             sceGnmDrawCmdSetLsShader(&cmd->gnm_cmd, &pipe->ls_regs, 0);
+            /* The TES (domain shader) runs on VS hardware post-tessellation.
+             * Emit SetVsShader with the TES registers (stored in vs_regs). */
+            if (pipe->has_ds_vs) {
+                sceGnmDrawCmdSetVsShader(&cmd->gnm_cmd, &pipe->vs_regs, 0);
+            }
+        } else if (pipe->has_es && pipe->has_gs) {
+            /* GS-only pipeline (no tess): VS compiled as ES.
+             * ES is set in the has_gs block below — don't call SetVsShader
+             * here because vs_regs is zeroed (VS was compiled as ES). */
         } else if (pipe->has_es && !pipe->has_gs) {
             /* TES compiled as ES (DS_ES path, no GS) */
             sceGnmDrawCmdSetEsShader(&cmd->gnm_cmd, &pipe->es_regs, 0);
         } else {
-            /* Standard VS or DS_VS */
+            /* Standard VS or DS_VS (no tess) */
             sceGnmDrawCmdSetVsShader(&cmd->gnm_cmd, &pipe->vs_regs, 0);
         }
 
         /* Set hull shader (tessellation control) if present */
         if (pipe->has_hs) {
-            /* lshsconfig: the LS-HS configuration word.
-             * For now, use 0 — the shader compiler sets the correct
-             * configuration in the shader binary. */
-            sceGnmDrawCmdSetHsShader(&cmd->gnm_cmd, &pipe->hs_regs, 0);
+            /* lshsconfig = VGT_LS_HS_CONFIG register value.
+             * HS_NUM_INPUT_CP = patchControlPoints (from Vulkan tess state)
+             * HS_NUM_OUTPUT_CP = patchControlPoints (default: same as input
+             *   when TCS output CP count is unknown — the shader compiler
+             *   may override this in the shader binary) */
+            uint32_t cp = pipe->tess_patch_control_points;
+            if (cp > 32) cp = 32;  /* 6-bit field, max 32 */
+            if (cp == 0) cp = 3;   /* default patch size */
+            uint32_t lshsconfig = S_028B58_HS_NUM_INPUT_CP(cp) |
+                                   S_028B58_HS_NUM_OUTPUT_CP(cp);
+            sceGnmDrawCmdSetHsShader(&cmd->gnm_cmd, &pipe->hs_regs, lshsconfig);
         }
 
         /* Set geometry shader if present */
@@ -1494,12 +1618,13 @@ vk_ps4_CmdCopyImage(VkCommandBuffer commandBuffer, VkImage srcImage, VkImageLayo
             if (src->memory && dst->memory &&
                 src->memory->gnm_mem.mapped && dst->memory->gnm_mem.mapped) {
                 /* For compressed formats, offsets are in blocks (4x4).
-                 * srcOffset.x/y are in pixels, so divide by 4 for block offsets. */
+                 * srcOffset.x/y are in pixels, so divide by 4 for block offsets.
+                 * Use floor division — the spec requires block-aligned offsets. */
                 uint32_t src_x_bytes = compressed
-                    ? ((r->srcOffset.x + 3) / 4) * bpp
+                    ? (r->srcOffset.x / 4) * bpp
                     : r->srcOffset.x * bpp;
                 uint32_t dst_x_bytes = compressed
-                    ? ((r->dstOffset.x + 3) / 4) * bpp
+                    ? (r->dstOffset.x / 4) * bpp
                     : r->dstOffset.x * bpp;
                 uint32_t src_y_pitch = compressed
                     ? ((r->srcOffset.y / 4) + y) * src_pitch
@@ -1614,9 +1739,7 @@ vk_ps4_CmdCopyBufferToImage(VkCommandBuffer commandBuffer, VkBuffer srcBuffer, V
         bool compressed = vk_format_is_compressed(dst->create_info.format);
         /* Buffer row length is in pixels; convert to bytes.
          * For compressed, bufferRowLength is in blocks (per Vulkan spec). */
-        uint32_t src_pitch = compressed
-            ? r->bufferRowLength * bpp
-            : r->bufferRowLength * bpp;
+        uint32_t src_pitch = r->bufferRowLength * bpp;
         if (src_pitch == 0)
             src_pitch = vk_format_row_size(dst->create_info.format,
                                            dst->create_info.extent.width);
@@ -1684,6 +1807,44 @@ vk_ps4_CmdCopyImageToBuffer(VkCommandBuffer commandBuffer, VkImage srcImage, VkI
 
 /* === Render pass commands === */
 
+/* Check if attachment `att_idx` is used by subpass `subpass` (via any
+ * color, depth/stencil, input, or resolve attachment reference). */
+static bool vk_ps4_attachment_used_in_subpass(VkPs4RenderPass *rp,
+                                               uint32_t att_idx, uint32_t subpass) {
+    if (subpass >= rp->subpass_count) return false;
+    const VkSubpassDescription *sp = &rp->subpasses[subpass];
+
+    if (sp->pColorAttachments) {
+        for (uint32_t i = 0; i < sp->colorAttachmentCount; i++) {
+            if (sp->pColorAttachments[i].attachment == att_idx) return true;
+        }
+    }
+    if (sp->pDepthStencilAttachment &&
+        sp->pDepthStencilAttachment->attachment == att_idx) {
+        return true;
+    }
+    if (sp->pInputAttachments) {
+        for (uint32_t i = 0; i < sp->inputAttachmentCount; i++) {
+            if (sp->pInputAttachments[i].attachment == att_idx) return true;
+        }
+    }
+    if (sp->pResolveAttachments) {
+        for (uint32_t i = 0; i < sp->colorAttachmentCount; i++) {
+            if (sp->pResolveAttachments[i].attachment == att_idx) return true;
+        }
+    }
+    return false;
+}
+
+/* Check if attachment `att_idx` is used in any subpass before `subpass`. */
+static bool vk_ps4_attachment_used_before_subpass(VkPs4RenderPass *rp,
+                                                   uint32_t att_idx, uint32_t subpass) {
+    for (uint32_t s = 0; s < subpass; s++) {
+        if (vk_ps4_attachment_used_in_subpass(rp, att_idx, s)) return true;
+    }
+    return false;
+}
+
 VKAPI_ATTR void VKAPI_CALL
 vk_ps4_CmdBeginRenderPass(VkCommandBuffer commandBuffer, const VkRenderPassBeginInfo *pBeginInfo,
                           VkSubpassContents contents) {
@@ -1699,8 +1860,16 @@ vk_ps4_CmdBeginRenderPass(VkCommandBuffer commandBuffer, const VkRenderPassBegin
     cmd->current_render_pass.framebuffer = fb;
     cmd->current_render_pass.render_area = pBeginInfo->renderArea;
     cmd->current_render_pass.current_subpass = 0;
-    cmd->current_render_pass.p_clear_values = pBeginInfo->pClearValues;
-    cmd->current_render_pass.clear_value_count = pBeginInfo->clearValueCount;
+    /* Deep-copy clear values — the caller's pClearValues may be freed
+     * after CmdBeginRenderPass returns, but CmdNextSubpass may need
+     * them later for attachments first used in subsequent subpasses. */
+    cmd->current_render_pass.clear_value_count =
+        (pBeginInfo->clearValueCount > 16) ? 16 : pBeginInfo->clearValueCount;
+    if (pBeginInfo->pClearValues && cmd->current_render_pass.clear_value_count > 0) {
+        memcpy(cmd->current_render_pass.clear_values,
+               pBeginInfo->pClearValues,
+               cmd->current_render_pass.clear_value_count * sizeof(VkClearValue));
+    }
 
     /* Set scissor to render area first (needed for draw-based clears) */
     sceGnmDrawCmdSetScreenScissor(&cmd->gnm_cmd,
@@ -1718,14 +1887,13 @@ vk_ps4_CmdBeginRenderPass(VkCommandBuffer commandBuffer, const VkRenderPassBegin
     /* Wait until safe for rendering on the video out handle */
     /* TODO: if this is a swapchain render, call sceGnmDrawCmdWaitUntilSafeForRendering */
 
-    /* Clear attachments if specified.
-     * Iterate framebuffer attachments and check loadOp from the render pass.
-     * Color clear: FillMemory (known limitation for tiled RTs — see
-     *   vk_ps4_clear_color_fillmem comment above).
-     * Depth clear: set clear values + DB_RENDER_CONTROL, then draw to trigger
-     *   the GCN lazy clear (which fires on the first depth access). */
-    if (pBeginInfo->clearValueCount > 0 && pBeginInfo->pClearValues) {
-        for (uint32_t i = 0; i < pBeginInfo->clearValueCount && i < fb->attachment_count; i++) {
+    /* Clear attachments whose loadOp is CLEAR and that are first used
+     * in subpass 0. Per the Vulkan spec, the load operation for each
+     * attachment is performed at the beginning of the subpass in which
+     * the attachment is first used. Attachments first used in later
+     * subpasses are cleared in CmdNextSubpass. */
+    if (cmd->current_render_pass.clear_value_count > 0) {
+        for (uint32_t i = 0; i < cmd->current_render_pass.clear_value_count && i < fb->attachment_count; i++) {
             VkPs4ImageView *view = fb->attachments[i];
             if (!view || !view->image) continue;
 
@@ -1733,10 +1901,16 @@ vk_ps4_CmdBeginRenderPass(VkCommandBuffer commandBuffer, const VkRenderPassBegin
             VkAttachmentLoadOp load_op = rp->attachments[i].loadOp;
             if (load_op != VK_ATTACHMENT_LOAD_OP_CLEAR) continue;
 
+            /* Only clear if this attachment is first used in subpass 0 */
+            if (!vk_ps4_attachment_used_in_subpass(rp, i, 0)) continue;
+            /* If it was used before subpass 0 (impossible, but guard anyway) */
+            if (vk_ps4_attachment_used_before_subpass(rp, i, 0)) continue;
+
             if (view->image->is_depth_target) {
                 /* Depth/stencil clear — only enable clear bits for planes
                  * that exist in the attachment format. */
-                const VkClearDepthStencilValue *ds = &pBeginInfo->pClearValues[i].depthStencil;
+                const VkClearDepthStencilValue *ds =
+                    &cmd->current_render_pass.clear_values[i].depthStencil;
                 VkFormat ds_fmt = view->image->create_info.format;
                 bool has_depth = vk_format_has_depth(ds_fmt);
                 bool has_stencil = vk_format_has_stencil(ds_fmt);
@@ -1756,16 +1930,12 @@ vk_ps4_CmdBeginRenderPass(VkCommandBuffer commandBuffer, const VkRenderPassBegin
                 db_ctrl.stencilclearenable = has_stencil ? 1 : 0;
                 sceGnmDrawCmdSetDbRenderControl(&cmd->gnm_cmd, &db_ctrl);
 
-                /* Trigger the lazy clear with a fullscreen draw.
-                 * This ensures the clear fires even if no subsequent draw
-                 * accesses depth. The app will rebind its pipeline after. */
+                /* Trigger the lazy clear with a fullscreen draw. */
                 vk_ps4_clear_depth_draw(&cmd->gnm_cmd);
 
             } else if (view->image->is_render_target) {
-                const VkClearColorValue *cc = &pBeginInfo->pClearValues[i].color;
-                /* FillMemory clear for all RTs (linear and tiled).
-                 * TODO: Use a draw-based clear with a proper clear PS for
-                 * tiled RTs to avoid corrupting the tiled memory layout. */
+                const VkClearColorValue *cc =
+                    &cmd->current_render_pass.clear_values[i].color;
                 vk_ps4_clear_color_fillmem(&cmd->gnm_cmd, view->image, cc);
             }
         }
@@ -1818,50 +1988,88 @@ vk_ps4_CmdNextSubpass(VkCommandBuffer commandBuffer, VkSubpassContents contents)
 
     /* Perform load-op clears for attachments first used in this subpass.
      * An attachment is "first used" if it appears in this subpass but not
-     * in any previous subpass. We check by scanning subpass 0..next-1. */
+     * in any previous subpass. We use the helper that checks all attachment
+     * reference types (color, depth/stencil, input, resolve). */
     if (fb && cmd->current_render_pass.render_area.extent.width > 0) {
         const VkSubpassDescription *subpass = &rp->subpasses[next];
 
-        /* Check color attachments */
-        if (subpass->pColorAttachments) {
+        /* Collect all attachment indices used by this subpass */
         for (uint32_t j = 0; j < subpass->colorAttachmentCount; j++) {
-            uint32_t att_idx = subpass->pColorAttachments[j].attachment;
-            if (att_idx == VK_ATTACHMENT_UNUSED) continue;
-            if (att_idx >= rp->attachment_count || att_idx >= fb->attachment_count)
-                continue;
-            if (rp->attachments[att_idx].loadOp != VK_ATTACHMENT_LOAD_OP_CLEAR)
-                continue;
+            if (subpass->pColorAttachments) {
+                uint32_t att_idx = subpass->pColorAttachments[j].attachment;
+                if (att_idx == VK_ATTACHMENT_UNUSED) continue;
+                if (att_idx >= rp->attachment_count || att_idx >= fb->attachment_count)
+                    continue;
+                if (rp->attachments[att_idx].loadOp != VK_ATTACHMENT_LOAD_OP_CLEAR) continue;
+                if (vk_ps4_attachment_used_before_subpass(rp, att_idx, next)) continue;
 
-            /* Check if this attachment was used in any previous subpass */
-            bool was_used = false;
-            for (uint32_t s = 0; s < next && !was_used; s++) {
-                const VkSubpassDescription *prev = &rp->subpasses[s];
-                if (prev->pColorAttachments) {
-                    for (uint32_t k = 0; k < prev->colorAttachmentCount; k++) {
-                        if (prev->pColorAttachments[k].attachment == att_idx) {
-                            was_used = true;
-                            break;
-                        }
-                    }
-                }
-                if (prev->pDepthStencilAttachment &&
-                    prev->pDepthStencilAttachment->attachment == att_idx)
-                    was_used = true;
-            }
-            if (was_used) continue;
-
-            /* First use — clear it */
-            VkPs4ImageView *view = fb->attachments[att_idx];
-            if (!view || !view->image || !view->image->is_render_target) continue;
-            if (att_idx < cmd->current_render_pass.pass->attachment_count) {
-                /* att_idx maps to clearValue index */
+                /* First use — clear it */
+                VkPs4ImageView *view = fb->attachments[att_idx];
+                if (!view || !view->image || !view->image->is_render_target) continue;
                 if (att_idx < cmd->current_render_pass.clear_value_count) {
                     const VkClearColorValue *cc =
-                        &cmd->current_render_pass.p_clear_values[att_idx].color;
+                        &cmd->current_render_pass.clear_values[att_idx].color;
+                    vk_ps4_clear_color_fillmem(&cmd->gnm_cmd, view->image, cc);
+                }
+            }
+            /* Also check resolve attachments */
+            if (subpass->pResolveAttachments) {
+                uint32_t att_idx = subpass->pResolveAttachments[j].attachment;
+                if (att_idx == VK_ATTACHMENT_UNUSED) continue;
+                if (att_idx >= rp->attachment_count || att_idx >= fb->attachment_count)
+                    continue;
+                if (rp->attachments[att_idx].loadOp != VK_ATTACHMENT_LOAD_OP_CLEAR) continue;
+                if (vk_ps4_attachment_used_before_subpass(rp, att_idx, next)) continue;
+
+                VkPs4ImageView *view = fb->attachments[att_idx];
+                if (!view || !view->image || !view->image->is_render_target) continue;
+                if (att_idx < cmd->current_render_pass.clear_value_count) {
+                    const VkClearColorValue *cc =
+                        &cmd->current_render_pass.clear_values[att_idx].color;
                     vk_ps4_clear_color_fillmem(&cmd->gnm_cmd, view->image, cc);
                 }
             }
         }
+
+        /* Check input attachments */
+        if (subpass->pInputAttachments) {
+            for (uint32_t j = 0; j < subpass->inputAttachmentCount; j++) {
+                uint32_t att_idx = subpass->pInputAttachments[j].attachment;
+                if (att_idx == VK_ATTACHMENT_UNUSED) continue;
+                if (att_idx >= rp->attachment_count || att_idx >= fb->attachment_count)
+                    continue;
+                if (rp->attachments[att_idx].loadOp != VK_ATTACHMENT_LOAD_OP_CLEAR) continue;
+                if (vk_ps4_attachment_used_before_subpass(rp, att_idx, next)) continue;
+
+                VkPs4ImageView *view = fb->attachments[att_idx];
+                if (!view || !view->image) continue;
+                if (view->image->is_render_target) {
+                    if (att_idx < cmd->current_render_pass.clear_value_count) {
+                        const VkClearColorValue *cc =
+                            &cmd->current_render_pass.clear_values[att_idx].color;
+                        vk_ps4_clear_color_fillmem(&cmd->gnm_cmd, view->image, cc);
+                    }
+                } else if (view->image->is_depth_target) {
+                    if (att_idx < cmd->current_render_pass.clear_value_count) {
+                        const VkClearDepthStencilValue *ds =
+                            &cmd->current_render_pass.clear_values[att_idx].depthStencil;
+                        VkFormat ds_fmt = view->image->create_info.format;
+                        bool has_depth = vk_format_has_depth(ds_fmt);
+                        bool has_stencil = vk_format_has_stencil(ds_fmt);
+                        if (has_depth)
+                            sceGnmDrawCmdSetDepthClearValue(&cmd->gnm_cmd, ds->depth);
+                        if (has_stencil)
+                            vk_ps4_emit_context_reg(&cmd->gnm_cmd,
+                                R_028028_DB_STENCIL_CLEAR, S_028028_CLEAR(ds->stencil));
+                        GnmDbRenderControl db_ctrl;
+                        memset(&db_ctrl, 0, sizeof(db_ctrl));
+                        db_ctrl.depthclearenable = has_depth ? 1 : 0;
+                        db_ctrl.stencilclearenable = has_stencil ? 1 : 0;
+                        sceGnmDrawCmdSetDbRenderControl(&cmd->gnm_cmd, &db_ctrl);
+                        vk_ps4_clear_depth_draw(&cmd->gnm_cmd);
+                    }
+                }
+            }
         }
 
         /* Check depth/stencil attachment */
@@ -1869,44 +2077,28 @@ vk_ps4_CmdNextSubpass(VkCommandBuffer commandBuffer, VkSubpassContents contents)
             uint32_t att_idx = subpass->pDepthStencilAttachment->attachment;
             if (att_idx != VK_ATTACHMENT_UNUSED &&
                 att_idx < rp->attachment_count && att_idx < fb->attachment_count &&
-                rp->attachments[att_idx].loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR) {
+                rp->attachments[att_idx].loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR &&
+                !vk_ps4_attachment_used_before_subpass(rp, att_idx, next)) {
 
-                bool was_used = false;
-                for (uint32_t s = 0; s < next && !was_used; s++) {
-                    const VkSubpassDescription *prev = &rp->subpasses[s];
-                    if (prev->pColorAttachments) {
-                        for (uint32_t k = 0; k < prev->colorAttachmentCount; k++) {
-                            if (prev->pColorAttachments[k].attachment == att_idx) {
-                                was_used = true;
-                                break;
-                            }
-                        }
-                    }
-                    if (prev->pDepthStencilAttachment &&
-                        prev->pDepthStencilAttachment->attachment == att_idx)
-                        was_used = true;
-                }
-                if (!was_used) {
-                    VkPs4ImageView *view = fb->attachments[att_idx];
-                    if (view && view->image && view->image->is_depth_target) {
-                        if (att_idx < cmd->current_render_pass.clear_value_count) {
-                            const VkClearDepthStencilValue *ds =
-                                &cmd->current_render_pass.p_clear_values[att_idx].depthStencil;
-                            VkFormat ds_fmt = view->image->create_info.format;
-                            bool has_depth = vk_format_has_depth(ds_fmt);
-                            bool has_stencil = vk_format_has_stencil(ds_fmt);
-                            if (has_depth)
-                                sceGnmDrawCmdSetDepthClearValue(&cmd->gnm_cmd, ds->depth);
-                            if (has_stencil)
-                                vk_ps4_emit_context_reg(&cmd->gnm_cmd,
-                                    R_028028_DB_STENCIL_CLEAR, S_028028_CLEAR(ds->stencil));
-                            GnmDbRenderControl db_ctrl;
-                            memset(&db_ctrl, 0, sizeof(db_ctrl));
-                            db_ctrl.depthclearenable = has_depth ? 1 : 0;
-                            db_ctrl.stencilclearenable = has_stencil ? 1 : 0;
-                            sceGnmDrawCmdSetDbRenderControl(&cmd->gnm_cmd, &db_ctrl);
-                            vk_ps4_clear_depth_draw(&cmd->gnm_cmd);
-                        }
+                VkPs4ImageView *view = fb->attachments[att_idx];
+                if (view && view->image && view->image->is_depth_target) {
+                    if (att_idx < cmd->current_render_pass.clear_value_count) {
+                        const VkClearDepthStencilValue *ds =
+                            &cmd->current_render_pass.clear_values[att_idx].depthStencil;
+                        VkFormat ds_fmt = view->image->create_info.format;
+                        bool has_depth = vk_format_has_depth(ds_fmt);
+                        bool has_stencil = vk_format_has_stencil(ds_fmt);
+                        if (has_depth)
+                            sceGnmDrawCmdSetDepthClearValue(&cmd->gnm_cmd, ds->depth);
+                        if (has_stencil)
+                            vk_ps4_emit_context_reg(&cmd->gnm_cmd,
+                                R_028028_DB_STENCIL_CLEAR, S_028028_CLEAR(ds->stencil));
+                        GnmDbRenderControl db_ctrl;
+                        memset(&db_ctrl, 0, sizeof(db_ctrl));
+                        db_ctrl.depthclearenable = has_depth ? 1 : 0;
+                        db_ctrl.stencilclearenable = has_stencil ? 1 : 0;
+                        sceGnmDrawCmdSetDbRenderControl(&cmd->gnm_cmd, &db_ctrl);
+                        vk_ps4_clear_depth_draw(&cmd->gnm_cmd);
                     }
                 }
             }
@@ -2031,19 +2223,69 @@ vk_ps4_CmdClearColorImage(VkCommandBuffer commandBuffer, VkImage image, VkImageL
 
     for (uint32_t r = 0; r < rangeCount; r++) {
         const VkImageSubresourceRange *range = &pRanges[r];
-        uint32_t mip_w = img->create_info.extent.width >> range->baseMipLevel;
-        uint32_t mip_h = img->create_info.extent.height >> range->baseMipLevel;
-        if (mip_w == 0) mip_w = 1;
-        if (mip_h == 0) mip_h = 1;
+        uint32_t level_count = range->levelCount == VK_REMAINING_MIP_LEVELS
+            ? img->create_info.mipLevels - range->baseMipLevel
+            : range->levelCount;
         uint32_t layer_count = range->layerCount == VK_REMAINING_ARRAY_LAYERS
             ? img->create_info.arrayLayers - range->baseArrayLayer
             : range->layerCount;
-        for (uint32_t l = 0; l < layer_count; l++) {
-            uint64_t addr = (uint64_t)img->memory->gnm_mem.mapped +
-                            img->memory_offset;
-            uint32_t size = mip_w * mip_h * bpp;
-            size = (size + 3) & ~3u;
-            sceGnmDrawCmdFillMemory(&cmd->gnm_cmd, addr, size, clear_val);
+
+        /* Compute the size of each mip level to calculate offsets.
+         * For tiled surfaces, the actual layout is managed by the GNM
+         * descriptor, but for linear fill we approximate with packed
+         * mip layout: each level is w*h*bpp, rounded up to 4-byte alignment. */
+        for (uint32_t lv = 0; lv < level_count; lv++) {
+            uint32_t mip_level = range->baseMipLevel + lv;
+            uint32_t mip_w = img->create_info.extent.width >> mip_level;
+            uint32_t mip_h = img->create_info.extent.height >> mip_level;
+            if (mip_w == 0) mip_w = 1;
+            if (mip_h == 0) mip_h = 1;
+            uint64_t mip_size = (uint64_t)mip_w * mip_h * bpp;
+            mip_size = (mip_size + 3) & ~3ULL;
+
+            /* Compute offset to this mip level.
+             * For simplicity, assume mip levels are packed sequentially
+             * from the base address. This is correct for linear images
+             * but approximate for tiled images. */
+            uint64_t mip_offset = 0;
+            for (uint32_t m = 0; m < mip_level; m++) {
+                uint32_t mw = img->create_info.extent.width >> m;
+                uint32_t mh = img->create_info.extent.height >> m;
+                if (mw == 0) mw = 1;
+                if (mh == 0) mh = 1;
+                uint64_t ms = (uint64_t)mw * mh * bpp;
+                mip_offset += (ms + 3) & ~3ULL;
+            }
+
+            /* Compute the total size of all mip levels in one layer.
+             * Used to compute the per-layer stride. */
+            uint64_t layer_stride = 0;
+            for (uint32_t m = 0; m < img->create_info.mipLevels; m++) {
+                uint32_t mw = img->create_info.extent.width >> m;
+                uint32_t mh = img->create_info.extent.height >> m;
+                if (mw == 0) mw = 1;
+                if (mh == 0) mh = 1;
+                uint64_t ms = (uint64_t)mw * mh * bpp;
+                layer_stride += (ms + 3) & ~3ULL;
+            }
+
+            for (uint32_t l = 0; l < layer_count; l++) {
+                uint64_t addr = (uint64_t)img->memory->gnm_mem.mapped +
+                                img->memory_offset +
+                                (uint64_t)(range->baseArrayLayer + l) * layer_stride +
+                                mip_offset;
+                /* FillMemory takes uint32_t size — split large fills */
+                uint64_t remaining = mip_size;
+                uint64_t cur = addr;
+                while (remaining > 0) {
+                    uint32_t chunk = (remaining > 0xFFFFFFFFu) ? 0xFFFFFFFFu : (uint32_t)remaining;
+                    chunk &= ~3u;
+                    if (chunk == 0) break;
+                    sceGnmDrawCmdFillMemory(&cmd->gnm_cmd, cur, chunk, clear_val);
+                    cur += chunk;
+                    remaining -= chunk;
+                }
+            }
         }
     }
     (void)imageLayout;

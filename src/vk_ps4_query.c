@@ -83,8 +83,10 @@ vk_ps4_DestroyQueryPool(VkDevice device, VkQueryPool queryPool, const VkAllocati
     VkPs4QueryPool *pool = (VkPs4QueryPool *)queryPool;
     const VkAllocationCallbacks *alloc = pAllocator ? pAllocator : &dev->allocator;
 
-    /* Release the direct memory using the stored full handle */
-    if (pool->result_buffer) {
+    /* Release the direct memory using the stored full handle.
+     * Check the 'allocated' flag rather than result_buffer to avoid
+     * leaking if result_buffer is NULL but gnm_mem was allocated. */
+    if (pool->gnm_mem.allocated) {
         sceGnmDirectMemoryRelease(&pool->gnm_mem);
     }
 
@@ -109,6 +111,15 @@ vk_ps4_GetQueryPoolResults(VkDevice device, VkQueryPool queryPool, uint32_t firs
     bool wait = (flags & VK_QUERY_RESULT_WAIT_BIT) != 0;
     bool with_availability = (flags & VK_QUERY_RESULT_WITH_AVAILABILITY_BIT) != 0;
     bool result_64 = (flags & VK_QUERY_RESULT_64_BIT) != 0;
+
+    /* Validate dataSize is large enough for the requested results.
+     * Each query needs (result_64 ? 8 : 4) bytes, plus the same for
+     * availability if requested. The last query may not need the full
+     * stride, but we use stride for all but the last for safety. */
+    size_t per_query = (result_64 ? 8 : 4) + (with_availability ? (result_64 ? 8 : 4) : 0);
+    if (queryCount > 0 && dataSize < (size_t)(queryCount - 1) * stride + per_query) {
+        return VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
 
     uint8_t *dst = (uint8_t *)pData;
     uint64_t *src = (uint64_t *)pool->result_buffer;
@@ -249,7 +260,9 @@ vk_ps4_CmdCopyQueryPoolResults(VkCommandBuffer commandBuffer, VkQueryPool queryP
     VkPs4Buffer *dst = (VkPs4Buffer *)dstBuffer;
 
     if (!dst || !dst->memory || !dst->memory->gnm_mem.mapped) return;
-    if (firstQuery + queryCount > pool->create_info.queryCount) return;
+    /* Overflow-safe bounds check */
+    if (firstQuery > pool->create_info.queryCount ||
+        queryCount > pool->create_info.queryCount - firstQuery) return;
 
     /* Copy query results from the query pool's GPU memory to the destination buffer.
      * We use sceGnmDrawCmdCopyMemory for each query result.

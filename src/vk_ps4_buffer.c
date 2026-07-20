@@ -101,7 +101,7 @@ vk_ps4_CreateBufferView(VkDevice device, const VkBufferViewCreateInfo *pCreateIn
         return VK_ERROR_INITIALIZATION_FAILED;
     }
 
-    /* Validate offset/range against buffer size */
+    /* Validate offset/range against buffer size (overflow-safe) */
     if (pCreateInfo->offset > buf->create_info.size) {
         return VK_ERROR_INITIALIZATION_FAILED;
     }
@@ -109,7 +109,8 @@ vk_ps4_CreateBufferView(VkDevice device, const VkBufferViewCreateInfo *pCreateIn
     if (range == VK_WHOLE_SIZE) {
         range = buf->create_info.size - pCreateInfo->offset;
     }
-    if (pCreateInfo->offset + range > buf->create_info.size) {
+    /* Overflow-safe: range > remaining is safe because offset <= size */
+    if (range > buf->create_info.size - pCreateInfo->offset) {
         return VK_ERROR_INITIALIZATION_FAILED;
     }
 

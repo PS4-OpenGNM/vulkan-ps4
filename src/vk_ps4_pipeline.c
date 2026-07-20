@@ -370,41 +370,54 @@ vk_ps4_CreateGraphicsPipelines(VkDevice device, VkPipelineCache pipelineCache,
                     break;
                 }
                 case VK_SHADER_STAGE_GEOMETRY_BIT: {
-                    /* GS shader binary: GnmShaderCommonData + GnmGsStageRegisters */
-                    const uint8_t *stage_ptr = (const uint8_t *)metadata.stage;
-                    const GnmGsStageRegisters *gs_regs =
-                        (const GnmGsStageRegisters *)(stage_ptr + sizeof(GnmShaderCommonData));
-                    pipe->gs_regs = *gs_regs;
+                    /* GS shader binary: GnmShaderCommonData + GnmGsStageRegisters.
+                     * NOTE: The current psbc compiler maps GS to GNM_SHADER_VERTEX
+                     * with a GnmVsShader header. Only extract GS registers when
+                     * the shader type is actually GNM_SHADER_GEOMETRY. */
+                    if (metadata.type == GNM_SHADER_GEOMETRY) {
+                        const uint8_t *stage_ptr = (const uint8_t *)metadata.stage;
+                        const GnmGsStageRegisters *gs_regs =
+                            (const GnmGsStageRegisters *)(stage_ptr + sizeof(GnmShaderCommonData));
+                        pipe->gs_regs = *gs_regs;
+                        pipe->has_gs = true;
+                    }
+                    /* Store the module regardless — it may be used later
+                     * when the compiler properly outputs GS binaries */
                     pipe->gs_module = mod;
-                    pipe->has_gs = true;
                     break;
                 }
                 case VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT: {
-                    /* TCS (hull shader): GnmShaderCommonData + GnmHsStageRegisters */
-                    const uint8_t *stage_ptr = (const uint8_t *)metadata.stage;
-                    const GnmHsStageRegisters *hs_regs =
-                        (const GnmHsStageRegisters *)(stage_ptr + sizeof(GnmShaderCommonData));
-                    pipe->hs_regs = *hs_regs;
+                    /* TCS (hull shader): GnmShaderCommonData + GnmHsStageRegisters.
+                     * NOTE: The current psbc compiler maps TCS to GNM_SHADER_VERTEX
+                     * with a GnmVsShader header. Only extract HS registers when
+                     * the shader type is actually GNM_SHADER_HULL. */
+                    if (metadata.type == GNM_SHADER_HULL) {
+                        const uint8_t *stage_ptr = (const uint8_t *)metadata.stage;
+                        const GnmHsStageRegisters *hs_regs =
+                            (const GnmHsStageRegisters *)(stage_ptr + sizeof(GnmShaderCommonData));
+                        pipe->hs_regs = *hs_regs;
+                        pipe->has_hs = true;
+                    }
                     pipe->tcs_module = mod;
-                    pipe->has_hs = true;
                     break;
                 }
                 case VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT: {
                     /* TES (domain shader): compiled as VS (DS_VS) or ES (DS_ES).
-                     * The shader type in the binary header tells us which.
-                     * For DS_VS: GnmShaderCommonData + GnmVsStageRegisters
-                     * For DS_ES: GnmShaderCommonData + GnmEsStageRegisters
-                     * We store it as VS regs (DS_VS is the common case). */
-                    const uint8_t *stage_ptr = (const uint8_t *)metadata.stage;
+                     * NOTE: The current psbc compiler maps TES to GNM_SHADER_VERTEX
+                     * with a GnmVsShader header. Only extract ES registers when
+                     * the shader type is GNM_SHADER_EXPORT. Otherwise, treat as VS. */
                     if (metadata.type == GNM_SHADER_EXPORT) {
+                        const uint8_t *stage_ptr = (const uint8_t *)metadata.stage;
                         const GnmEsStageRegisters *es_regs =
                             (const GnmEsStageRegisters *)(stage_ptr + sizeof(GnmShaderCommonData));
                         pipe->es_regs = *es_regs;
                         pipe->has_es = true;
                     } else {
-                        /* DS_VS: treat as vertex shader */
+                        /* DS_VS or compiler fallback: treat as vertex shader.
+                         * Extract VS registers so CmdBindPipeline can use them. */
                         const GnmVsShader *vs = (const GnmVsShader *)metadata.stage;
                         pipe->vs_regs = vs->registers;
+                        pipe->has_ds_vs = true;
                     }
                     pipe->tes_module = mod;
                     break;

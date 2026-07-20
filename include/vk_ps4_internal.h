@@ -182,7 +182,7 @@ struct VkPs4CommandBuffer {
         VkPs4Framebuffer *framebuffer;
         VkRect2D render_area;
         uint32_t current_subpass;  /* index into pass->subpasses */
-        const VkClearValue *p_clear_values;  /* from CmdBeginRenderPass */
+        VkClearValue clear_values[16];  /* deep-copied from CmdBeginRenderPass */
         uint32_t clear_value_count;
     } current_render_pass;
     /* Current pipeline */
@@ -352,6 +352,7 @@ struct VkPs4Pipeline {
     bool has_ls;  /* tessellation control shader (LS = VS before tess) */
     bool has_gs;  /* geometry shader */
     bool has_es;  /* geometry shader (ES = VS before GS) */
+    bool has_ds_vs;  /* TES compiled as DS_VS (post-tessellation VS) */
     uint32_t tess_patch_control_points;  /* from VkPipelineTessellationStateCreateInfo */
     /* Pipeline state */
     VkPipelineVertexInputStateCreateInfo vertex_input_state;
