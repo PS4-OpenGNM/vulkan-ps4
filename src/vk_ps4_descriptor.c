@@ -494,8 +494,81 @@ vk_ps4_CmdBindDescriptorSets(VkCommandBuffer commandBuffer, VkPipelineBindPoint 
             }
         }
     } else if (pipelineBindPoint == VK_PIPELINE_BIND_POINT_COMPUTE) {
-        /* Compute pipeline — CS input usage slots.
-         * CS slot table extraction is Phase 2 step 21. For now, no-op. */
+        /* Compute pipeline — CS input usage slots stored in
+         * pipe->vs_input_usage_slots (reused for CS). */
+        slots = pipe->vs_input_usage_slots;
+        slot_count = pipe->vs_input_usage_slot_count;
+        stage = GNM_STAGE_CS;
+
+        for (uint32_t i = 0; i < slot_count; i++) {
+            const GnmInputUsageSlot *slot = &slots[i];
+            uint32_t apislot = slot->apislot;
+
+            VkPs4DescriptorSet *set = NULL;
+            for (uint32_t si = 0; si < setCount; si++) {
+                set = (VkPs4DescriptorSet *)pDescriptorSets[si];
+                if (set && apislot < set->binding_count) {
+                    break;
+                }
+                set = NULL;
+            }
+            if (!set) continue;
+
+            VkPs4DescriptorBinding *b = find_binding(set, apislot);
+            if (!b || b->count == 0) continue;
+
+            switch (slot->usagetype) {
+            case GNM_SHINPUTUSAGE_IMM_CONSTBUFFER:
+            case GNM_SHINPUTUSAGE_IMM_VERTEXBUFFER:
+                if (b->buffers) {
+                    sceGnmDrawCmdSetVsharpUserData(
+                        &cmd->gnm_cmd, stage, slot->startregister,
+                        &b->buffers[0]
+                    );
+                }
+                break;
+            case GNM_SHINPUTUSAGE_IMM_RESOURCE:
+            case GNM_SHINPUTUSAGE_IMM_RWRESOURCE:
+                if (b->textures) {
+                    sceGnmDrawCmdSetTsharpUserData(
+                        &cmd->gnm_cmd, stage, slot->startregister,
+                        &b->textures[0]
+                    );
+                }
+                break;
+            case GNM_SHINPUTUSAGE_IMM_SAMPLER:
+                if (b->samplers) {
+                    sceGnmDrawCmdSetSsharpUserData(
+                        &cmd->gnm_cmd, stage, slot->startregister,
+                        &b->samplers[0]
+                    );
+                }
+                break;
+            case GNM_SHINPUTUSAGE_PTR_CONSTBUFFERTABLE:
+            case GNM_SHINPUTUSAGE_PTR_RESOURCETABLE:
+            case GNM_SHINPUTUSAGE_PTR_SAMPLERTABLE:
+            case GNM_SHINPUTUSAGE_PTR_RWRESOURCETABLE:
+                if (b->buffers) {
+                    sceGnmDrawCmdSetPointerUserData(
+                        &cmd->gnm_cmd, stage, slot->startregister,
+                        b->buffers
+                    );
+                } else if (b->textures) {
+                    sceGnmDrawCmdSetPointerUserData(
+                        &cmd->gnm_cmd, stage, slot->startregister,
+                        b->textures
+                    );
+                } else if (b->samplers) {
+                    sceGnmDrawCmdSetPointerUserData(
+                        &cmd->gnm_cmd, stage, slot->startregister,
+                        b->samplers
+                    );
+                }
+                break;
+            default:
+                break;
+            }
+        }
     }
 
     (void)firstSet;

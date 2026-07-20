@@ -290,12 +290,36 @@ vk_ps4_CreateComputePipelines(VkDevice device, VkPipelineCache pipelineCache,
         }
 
         bool cs_ok = false;
-        if (metadata.fileheader && metadata.stage) {
-            /* Extract CS stage registers.
-             * GnmCsShader layout may differ — store the module and mark valid.
-             * Full CS register extraction is Phase 2. */
+        if (metadata.fileheader && metadata.common) {
             pipe->cs_module = mod;
-            cs_ok = true;
+
+            /* Set up CS stage registers — the CS shader binary doesn't
+             * contain GnmCsStageRegisters; the driver fills them in.
+             * The shader code address is set via sceGnmCsRegsSetAddress. */
+            if (metadata.shadercode) {
+                sceGnmCsRegsSetAddress(&pipe->cs_regs, metadata.shadercode);
+
+                /* Set thread group counts from the shader's resource regs.
+                 * For now, leave them at 0 — they'll be set per-dispatch
+                 * by the hardware based on the dispatch dimensions. */
+
+                /* Extract CS input usage slots — for CS, the input usage
+                 * slot table follows GnmShaderCommonData in the binary.
+                 * The metadata extraction doesn't set inputusageslots for
+                 * CS (falls through to default), so we extract them here. */
+                if (metadata.numinputusageslots > 0 && metadata.common) {
+                    const uint8_t *base = (const uint8_t *)metadata.common;
+                    const GnmInputUsageSlot *cs_slots =
+                        (const GnmInputUsageSlot *)(base + sizeof(GnmShaderCommonData));
+                    uint32_t nslots = metadata.numinputusageslots;
+                    if (nslots > VK_PS4_MAX_INPUT_USAGE_SLOTS) nslots = VK_PS4_MAX_INPUT_USAGE_SLOTS;
+                    memcpy(pipe->vs_input_usage_slots, cs_slots, nslots * sizeof(GnmInputUsageSlot));
+                    /* Store CS slots in vs_input_usage_slots for CmdBindDescriptorSets */
+                    pipe->vs_input_usage_slot_count = nslots;
+                }
+
+                cs_ok = true;
+            }
         }
 
         if (binary && binary != mod->binary) {
