@@ -1,1 +1,0 @@
-/usr/bin/cc -g -arch arm64 -Wl,-search_paths_first -Wl,-headerpad_max_install_names -L/opt/homebrew/opt/zlib/lib -L/opt/homebrew/Cellar/zstd/1.5.7/lib -L/opt/homebrew/opt/mbedtls/lib CMakeFiles/vk_ps4_format_test.dir/tests/test_format.c.o -o vk_ps4_format_test  -Wl,-rpath,/Users/bizkut/Downloads/PS5/homebrew/ps4-freegnm/vulkan-ps4/build libvulkan_ps4.dylib
