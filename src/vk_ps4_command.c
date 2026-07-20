@@ -556,28 +556,79 @@ VKAPI_ATTR void VKAPI_CALL
 vk_ps4_CmdCopyImage(VkCommandBuffer commandBuffer, VkImage srcImage, VkImageLayout srcImageLayout,
                     VkImage dstImage, VkImageLayout dstImageLayout,
                     uint32_t regionCount, const VkImageCopy *pRegions) {
-    /* Phase 2 */
-    (void)commandBuffer;
-    (void)srcImage;
+    if (!commandBuffer || !pRegions) return;
+    VkPs4CommandBuffer *cmd = (VkPs4CommandBuffer *)commandBuffer;
+    VkPs4Image *src = (VkPs4Image *)srcImage;
+    VkPs4Image *dst = (VkPs4Image *)dstImage;
+    if (!src || !dst) return;
+
+    /* For MVP, use CopyMemory for linear-to-linear image copies.
+     * Tiled texture copies require a shader-based blit or CP DMA with
+     * surface info — deferred to Phase 3. */
+    for (uint32_t i = 0; i < regionCount; i++) {
+        const VkImageCopy *r = &pRegions[i];
+        uint32_t bpp = 4;  /* simplified — should use format-specific bpp */
+        uint32_t src_pitch = src->create_info.extent.width * bpp;
+        uint32_t dst_pitch = dst->create_info.extent.width * bpp;
+        uint32_t copy_width = r->extent.width * bpp;
+        uint32_t copy_height = r->extent.height;
+
+        for (uint32_t y = 0; y < copy_height; y++) {
+            if (src->memory && dst->memory &&
+                src->memory->gnm_mem.mapped && dst->memory->gnm_mem.mapped) {
+                uint64_t src_addr = (uint64_t)src->memory->gnm_mem.mapped +
+                                    src->memory_offset +
+                                    (uint64_t)(r->srcOffset.y + y) * src_pitch +
+                                    (uint64_t)r->srcOffset.x * bpp;
+                uint64_t dst_addr = (uint64_t)dst->memory->gnm_mem.mapped +
+                                    dst->memory_offset +
+                                    (uint64_t)(r->dstOffset.y + y) * dst_pitch +
+                                    (uint64_t)r->dstOffset.x * bpp;
+                sceGnmDrawCmdCopyMemory(&cmd->gnm_cmd, dst_addr, src_addr, copy_width);
+            }
+        }
+    }
     (void)srcImageLayout;
-    (void)dstImage;
     (void)dstImageLayout;
-    (void)regionCount;
-    (void)pRegions;
 }
 
 VKAPI_ATTR void VKAPI_CALL
 vk_ps4_CmdBlitImage(VkCommandBuffer commandBuffer, VkImage srcImage, VkImageLayout srcImageLayout,
                     VkImage dstImage, VkImageLayout dstImageLayout,
                     uint32_t regionCount, const VkImageBlit *pRegions, VkFilter filter) {
-    /* Phase 2 */
-    (void)commandBuffer;
-    (void)srcImage;
-    (void)srcImageLayout;
-    (void)dstImage;
-    (void)dstImageLayout;
-    (void)regionCount;
-    (void)pRegions;
+    /* BlitImage with scaling/format conversion requires a shader-based blit.
+     * For MVP, fall back to CmdCopyImage if regions are 1:1.
+     * Full blit support is Phase 3. */
+    if (!commandBuffer || !pRegions) return;
+
+    bool is_1to1 = true;
+    for (uint32_t i = 0; i < regionCount; i++) {
+        const VkImageBlit *r = &pRegions[i];
+        if (r->srcOffsets[0].x != r->dstOffsets[0].x ||
+            r->srcOffsets[0].y != r->dstOffsets[0].y ||
+            (r->srcOffsets[1].x - r->srcOffsets[0].x) != (r->dstOffsets[1].x - r->dstOffsets[0].x) ||
+            (r->srcOffsets[1].y - r->srcOffsets[0].y) != (r->dstOffsets[1].y - r->dstOffsets[0].y)) {
+            is_1to1 = false;
+            break;
+        }
+    }
+
+    if (is_1to1) {
+        VkImageCopy copies[16];
+        uint32_t count = regionCount > 16 ? 16 : regionCount;
+        for (uint32_t i = 0; i < count; i++) {
+            const VkImageBlit *r = &pRegions[i];
+            copies[i].srcSubresource = r->srcSubresource;
+            copies[i].dstSubresource = r->dstSubresource;
+            copies[i].srcOffset = r->srcOffsets[0];
+            copies[i].dstOffset = r->dstOffsets[0];
+            copies[i].extent.width = r->srcOffsets[1].x - r->srcOffsets[0].x;
+            copies[i].extent.height = r->srcOffsets[1].y - r->srcOffsets[0].y;
+            copies[i].extent.depth = r->srcOffsets[1].z - r->srcOffsets[0].z;
+        }
+        vk_ps4_CmdCopyImage(commandBuffer, srcImage, srcImageLayout,
+                            dstImage, dstImageLayout, count, copies);
+    }
     (void)filter;
 }
 
@@ -585,25 +636,74 @@ VKAPI_ATTR void VKAPI_CALL
 vk_ps4_CmdCopyBufferToImage(VkCommandBuffer commandBuffer, VkBuffer srcBuffer, VkImage dstImage,
                             VkImageLayout dstImageLayout, uint32_t regionCount,
                             const VkBufferImageCopy *pRegions) {
-    /* Phase 2 */
-    (void)commandBuffer;
-    (void)srcBuffer;
-    (void)dstImage;
+    if (!commandBuffer || !pRegions) return;
+    VkPs4CommandBuffer *cmd = (VkPs4CommandBuffer *)commandBuffer;
+    VkPs4Buffer *src = (VkPs4Buffer *)srcBuffer;
+    VkPs4Image *dst = (VkPs4Image *)dstImage;
+    if (!src || !dst || !src->memory || !dst->memory) return;
+    if (!src->memory->gnm_mem.mapped || !dst->memory->gnm_mem.mapped) return;
+
+    /* For MVP, use GPU CopyMemory for linear-to-linear copies.
+     * Tiled texture upload requires CP DMA with surface info or a
+     * shader-based copy — deferred to Phase 3. */
+    for (uint32_t i = 0; i < regionCount; i++) {
+        const VkBufferImageCopy *r = &pRegions[i];
+        uint32_t bpp = 4;
+        uint32_t src_pitch = r->bufferRowLength * bpp;
+        if (src_pitch == 0) src_pitch = dst->create_info.extent.width * bpp;
+        uint32_t dst_pitch = dst->create_info.extent.width * bpp;
+        uint32_t copy_width = r->imageExtent.width * bpp;
+        uint32_t copy_height = r->imageExtent.height;
+
+        uint64_t src_base = (uint64_t)src->memory->gnm_mem.mapped +
+                            src->memory_offset + r->bufferOffset;
+        uint64_t dst_base = (uint64_t)dst->memory->gnm_mem.mapped +
+                            dst->memory_offset;
+
+        for (uint32_t y = 0; y < copy_height; y++) {
+            uint64_t src_addr = src_base + (uint64_t)y * src_pitch;
+            uint64_t dst_addr = dst_base +
+                                (uint64_t)(r->imageOffset.y + y) * dst_pitch +
+                                (uint64_t)r->imageOffset.x * bpp;
+            sceGnmDrawCmdCopyMemory(&cmd->gnm_cmd, dst_addr, src_addr, copy_width);
+        }
+    }
     (void)dstImageLayout;
-    (void)regionCount;
-    (void)pRegions;
 }
 
 VKAPI_ATTR void VKAPI_CALL
 vk_ps4_CmdCopyImageToBuffer(VkCommandBuffer commandBuffer, VkImage srcImage, VkImageLayout srcImageLayout,
                             VkBuffer dstBuffer, uint32_t regionCount, const VkBufferImageCopy *pRegions) {
-    /* Phase 2 */
-    (void)commandBuffer;
-    (void)srcImage;
+    if (!commandBuffer || !pRegions) return;
+    VkPs4CommandBuffer *cmd = (VkPs4CommandBuffer *)commandBuffer;
+    VkPs4Image *src = (VkPs4Image *)srcImage;
+    VkPs4Buffer *dst = (VkPs4Buffer *)dstBuffer;
+    if (!src || !dst || !src->memory || !dst->memory) return;
+    if (!src->memory->gnm_mem.mapped || !dst->memory->gnm_mem.mapped) return;
+
+    for (uint32_t i = 0; i < regionCount; i++) {
+        const VkBufferImageCopy *r = &pRegions[i];
+        uint32_t bpp = 4;
+        uint32_t src_pitch = src->create_info.extent.width * bpp;
+        uint32_t dst_pitch = r->bufferRowLength * bpp;
+        if (dst_pitch == 0) dst_pitch = src->create_info.extent.width * bpp;
+        uint32_t copy_width = r->imageExtent.width * bpp;
+        uint32_t copy_height = r->imageExtent.height;
+
+        uint64_t src_base = (uint64_t)src->memory->gnm_mem.mapped +
+                            src->memory_offset;
+        uint64_t dst_base = (uint64_t)dst->memory->gnm_mem.mapped +
+                            dst->memory_offset + r->bufferOffset;
+
+        for (uint32_t y = 0; y < copy_height; y++) {
+            uint64_t src_addr = src_base +
+                                (uint64_t)(r->imageOffset.y + y) * src_pitch +
+                                (uint64_t)r->imageOffset.x * bpp;
+            uint64_t dst_addr = dst_base + (uint64_t)y * dst_pitch;
+            sceGnmDrawCmdCopyMemory(&cmd->gnm_cmd, dst_addr, src_addr, copy_width);
+        }
+    }
     (void)srcImageLayout;
-    (void)dstBuffer;
-    (void)regionCount;
-    (void)pRegions;
 }
 
 /* === Render pass commands === */
@@ -695,6 +795,15 @@ vk_ps4_CmdPipelineBarrier(VkCommandBuffer commandBuffer, VkPipelineStageFlags sr
         GNM_CACHE_FLUSH_AND_INV_TS_EVENT, 0,
         GNM_DATA_SEL_DISCARD, 0);
 
+    /* Track image layout transitions */
+    for (uint32_t i = 0; i < imageMemoryBarrierCount; i++) {
+        const VkImageMemoryBarrier *b = &pImageMemoryBarriers[i];
+        if (b->oldLayout != b->newLayout) {
+            VkPs4Image *img = (VkPs4Image *)b->image;
+            if (img) img->layout = b->newLayout;
+        }
+    }
+
     (void)srcStageMask;
     (void)dstStageMask;
     (void)dependencyFlags;
@@ -702,8 +811,6 @@ vk_ps4_CmdPipelineBarrier(VkCommandBuffer commandBuffer, VkPipelineStageFlags sr
     (void)pMemoryBarriers;
     (void)bufferMemoryBarrierCount;
     (void)pBufferMemoryBarriers;
-    (void)imageMemoryBarrierCount;
-    (void)pImageMemoryBarriers;
 }
 
 /* === Clear commands === */
