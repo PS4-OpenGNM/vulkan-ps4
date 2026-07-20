@@ -25,8 +25,19 @@ vk_ps4_CreateSwapchainKHR(VkDevice device, const VkSwapchainCreateInfoKHR *pCrea
     if (!sc) return VK_ERROR_OUT_OF_HOST_MEMORY;
     sc->type = VK_PS4_OBJ_SWAPCHAIN_KHR;
     sc->device = dev;
-    sc->create_info = *pCreateInfo;
+    sc->create_info = *pCreateInfo;  /* shallow copy — see below for pointer fixup */
     sc->current_image = 0;
+
+    /* Validate minImageCount */
+    if (pCreateInfo->minImageCount == 0) {
+        vk_ps4_free(alloc, sc);
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+
+    /* Null out dangling pointers in create_info — we don't use them after creation */
+    sc->create_info.pNext = NULL;
+    sc->create_info.pQueueFamilyIndices = NULL;
+    sc->create_info.oldSwapchain = VK_NULL_HANDLE;
 
     /* Initialize VideoOut */
     GnmVideoOutCreateInfo vo_info;
@@ -42,6 +53,10 @@ vk_ps4_CreateSwapchainKHR(VkDevice device, const VkSwapchainCreateInfoKHR *pCrea
     vo_info.numbuffers = pCreateInfo->minImageCount;
     if (vo_info.numbuffers > GNM_VIDEO_OUT_MAX_BUFFERS) {
         vo_info.numbuffers = GNM_VIDEO_OUT_MAX_BUFFERS;
+    }
+    if (vo_info.numbuffers == 0) {
+        vk_ps4_free(alloc, sc);
+        return VK_ERROR_INITIALIZATION_FAILED;
     }
 
     /* Open VideoOut */
@@ -60,6 +75,7 @@ vk_ps4_CreateSwapchainKHR(VkDevice device, const VkSwapchainCreateInfoKHR *pCrea
         return VK_ERROR_OUT_OF_HOST_MEMORY;
     }
 
+    bool rt_ok = true;
     for (uint32_t i = 0; i < sc->image_count; i++) {
         VkPs4Image *img = &sc->images[i];
         img->type = VK_PS4_OBJ_IMAGE;
@@ -83,21 +99,30 @@ vk_ps4_CreateSwapchainKHR(VkDevice device, const VkSwapchainCreateInfoKHR *pCrea
 
         /* Set up render target descriptor pointing to the VideoOut buffer */
         void *buffer = sceGnmVideoOutGetBuffer(&sc->video_out, i);
-        if (buffer) {
-            GnmDataFormat gnm_fmt = vk_ps4_vk_format_to_gnm(pCreateInfo->imageFormat);
-            uint64_t rt_size = 0;
-            uint32_t rt_align = 0;
-            GnmError rt_err = sceGnmRtCreateColorTarget(
-                &img->gnm_rt, buffer, gnm_fmt,
-                width, height, 1, 1, 1,
-                GNM_TM_DISPLAY_LINEAR_GENERAL, GNM_GPU_BASE,
-                &rt_size, &rt_align
-            );
-            if (rt_err != GNM_ERROR_OK) {
-                /* If RT creation fails, just set the base address directly */
-                sceGnmRtSetBaseAddr(&img->gnm_rt, buffer);
-            }
+        if (!buffer) {
+            rt_ok = false;
+            break;
         }
+        GnmDataFormat gnm_fmt = vk_ps4_vk_format_to_gnm(pCreateInfo->imageFormat);
+        uint64_t rt_size = 0;
+        uint32_t rt_align = 0;
+        GnmError rt_err = sceGnmRtCreateColorTarget(
+            &img->gnm_rt, buffer, gnm_fmt,
+            width, height, 1, 1, 1,
+            GNM_TM_DISPLAY_LINEAR_GENERAL, GNM_GPU_BASE,
+            &rt_size, &rt_align
+        );
+        if (rt_err != GNM_ERROR_OK) {
+            rt_ok = false;
+            break;
+        }
+    }
+
+    if (!rt_ok) {
+        vk_ps4_free(alloc, sc->images);
+        sceGnmVideoOutClose(&sc->video_out);
+        vk_ps4_free(alloc, sc);
+        return VK_ERROR_INITIALIZATION_FAILED;
     }
 
     *pSwapchain = (VkSwapchainKHR)sc;
@@ -152,12 +177,17 @@ vk_ps4_AcquireNextImageKHR(VkDevice device, VkSwapchainKHR swapchain, uint64_t t
         return VK_ERROR_INITIALIZATION_FAILED;
     }
     VkPs4Swapchain *sc = (VkPs4Swapchain *)swapchain;
+    if (sc->image_count == 0) {
+        return VK_ERROR_SURFACE_LOST_KHR;
+    }
 
-    /* MVP: round-robin buffer selection */
+    /* MVP: round-robin buffer selection.
+     * Not thread-safe — caller must synchronize AcquireNextImageKHR calls.
+     * No GPU sync — MVP assumes synchronous submit. */
     *pImageIndex = sc->current_image;
     sc->current_image = (sc->current_image + 1) % sc->image_count;
 
-    /* Signal semaphore and fence (synchronous in MVP) */
+    /* Signal semaphore and fence (synchronous in MVP — submit is blocking) */
     if (semaphore) {
         VkPs4Semaphore *sem = (VkPs4Semaphore *)semaphore;
         sem->signaled = true;
@@ -175,16 +205,29 @@ vk_ps4_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR *pPresentInfo) {
     if (!queue || !pPresentInfo) {
         return VK_ERROR_INITIALIZATION_FAILED;
     }
+    if (!pPresentInfo->pSwapchains || !pPresentInfo->pImageIndices) {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
     VkPs4Queue *q = (VkPs4Queue *)queue;
+
+    /* Wait on semaphores (MVP: CPU-tracked, just check signaled flag) */
+    for (uint32_t s = 0; s < pPresentInfo->waitSemaphoreCount; s++) {
+        VkPs4Semaphore *sem = (VkPs4Semaphore *)pPresentInfo->pWaitSemaphores[s];
+        if (sem) {
+            /* MVP: semaphores are signaled synchronously, so just reset */
+            sem->signaled = false;
+        }
+    }
 
     /* For MVP, just signal the swapchain's video out flip.
      * Real implementation would submit the command buffer with a flip. */
     for (uint32_t i = 0; i < pPresentInfo->swapchainCount; i++) {
         VkPs4Swapchain *sc = (VkPs4Swapchain *)pPresentInfo->pSwapchains[i];
+        if (!sc) continue;
         uint32_t image_index = pPresentInfo->pImageIndices[i];
 
         /* Submit flip for this buffer */
-        if (sc && image_index < sc->image_count) {
+        if (image_index < sc->image_count) {
             sceGnmVideoOutSubmitFlipAndWait(
                 &sc->video_out, image_index, (int64_t)sc->video_out.frame,
                 GNM_VIDEO_OUT_FLIP_VSYNC

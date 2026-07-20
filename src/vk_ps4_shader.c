@@ -47,6 +47,10 @@ vk_ps4_CreateShaderModule(VkDevice device, const VkShaderModuleCreateInfo *pCrea
 
     /* Store a copy of the SPIR-V for later compilation */
     size_t spirv_size = pCreateInfo->codeSize;
+    if (spirv_size == 0 || !pCreateInfo->pCode) {
+        vk_ps4_free(alloc, mod);
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
     void *spirv_copy = vk_ps4_alloc(alloc, spirv_size, 4);
     if (!spirv_copy) {
         vk_ps4_free(alloc, mod);
@@ -60,6 +64,10 @@ vk_ps4_CreateShaderModule(VkDevice device, const VkShaderModuleCreateInfo *pCrea
 #else
     /* No libpsbc — store SPIR-V as-is (stub mode) */
     size_t spirv_size = pCreateInfo->codeSize;
+    if (spirv_size == 0 || !pCreateInfo->pCode) {
+        vk_ps4_free(alloc, mod);
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
     void *spirv_copy = vk_ps4_alloc(alloc, spirv_size, 4);
     if (!spirv_copy) {
         vk_ps4_free(alloc, mod);
@@ -97,11 +105,11 @@ VkResult vk_ps4_compile_shader_module(VkPs4ShaderModule *mod, VkShaderStageFlagB
     }
 
 #ifdef VK_PS4_HAVE_PSBC
-    /* Initialize libpsbc (refcounted) */
+    /* Initialize libpsbc (refcounted — call psbc_shutdown to release) */
     psbc_init();
 
-    /* Set up compile options */
-    PsbcCompileOptions opts;
+    /* Set up compile options (zero-init to avoid stack garbage) */
+    PsbcCompileOptions opts = {0};
     opts.target = PSBC_TARGET_PS4_BASE;
     opts.entrypoint = "main";
     opts.optimise = true;
@@ -114,7 +122,9 @@ VkResult vk_ps4_compile_shader_module(VkPs4ShaderModule *mod, VkShaderStageFlagB
     case VK_SHADER_STAGE_GEOMETRY_BIT: opts.stage = PSBC_STAGE_GEOMETRY; break;
     case VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT: opts.stage = PSBC_STAGE_TESS_CTRL; break;
     case VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT: opts.stage = PSBC_STAGE_TESS_EVAL; break;
-    default: return VK_ERROR_FEATURE_NOT_PRESENT;
+    default:
+        psbc_shutdown();
+        return VK_ERROR_FEATURE_NOT_PRESENT;
     }
 
     /* Compile */
@@ -127,6 +137,7 @@ VkResult vk_ps4_compile_shader_module(VkPs4ShaderModule *mod, VkShaderStageFlagB
     );
 
     if (result != PSBC_RESULT_OK) {
+        psbc_shutdown();
         return VK_ERROR_FEATURE_NOT_PRESENT;
     }
 
@@ -134,6 +145,7 @@ VkResult vk_ps4_compile_shader_module(VkPs4ShaderModule *mod, VkShaderStageFlagB
     void *binary_copy = vk_ps4_alloc(alloc, output.size, 16);
     if (!binary_copy) {
         psbc_free_output(&output);
+        psbc_shutdown();
         return VK_ERROR_OUT_OF_HOST_MEMORY;
     }
     memcpy(binary_copy, output.data, output.size);
@@ -147,11 +159,13 @@ VkResult vk_ps4_compile_shader_module(VkPs4ShaderModule *mod, VkShaderStageFlagB
             binary_copy, output.size, out_metadata
         );
         if (gnm_err != GNM_ERROR_OK) {
-            /* Metadata extraction failed — pipeline creation will handle this */
+            /* Metadata extraction failed — zero out metadata to be safe */
+            memset(out_metadata, 0, sizeof(*out_metadata));
         }
     }
 
     psbc_free_output(&output);
+    psbc_shutdown();
     return VK_SUCCESS;
 #else
     (void)stage;

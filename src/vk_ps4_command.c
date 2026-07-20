@@ -46,6 +46,17 @@ vk_ps4_DestroyCommandPool(VkDevice device, VkCommandPool commandPool, const VkAl
     VkPs4Device *dev = (VkPs4Device *)device;
     VkPs4CommandPool *pool = (VkPs4CommandPool *)commandPool;
     const VkAllocationCallbacks *alloc = pAllocator ? pAllocator : &dev->allocator;
+
+    /* Free all command buffers allocated from this pool */
+    for (uint32_t i = 0; i < pool->command_buffer_count; i++) {
+        VkPs4CommandBuffer *cmd = pool->command_buffers[i];
+        if (cmd) {
+            if (cmd->pm4_buffer) vk_ps4_free(alloc, cmd->pm4_buffer);
+            vk_ps4_free(alloc, cmd);
+            pool->command_buffers[i] = NULL;
+        }
+    }
+    pool->command_buffer_count = 0;
     vk_ps4_free(alloc, pool);
 }
 
@@ -57,6 +68,7 @@ vk_ps4_AllocateCommandBuffers(VkDevice device, const VkCommandBufferAllocateInfo
     }
     VkPs4Device *dev = (VkPs4Device *)device;
     const VkAllocationCallbacks *alloc = &dev->allocator;
+    VkPs4CommandPool *pool = (VkPs4CommandPool *)pAllocateInfo->commandPool;
 
     for (uint32_t i = 0; i < pAllocateInfo->commandBufferCount; i++) {
         VkPs4CommandBuffer *cmd = vk_ps4_alloc_zero(alloc, sizeof(*cmd), 16);
@@ -70,7 +82,7 @@ vk_ps4_AllocateCommandBuffers(VkDevice device, const VkCommandBufferAllocateInfo
         }
         cmd->type = VK_PS4_OBJ_COMMAND_BUFFER;
         cmd->device = dev;
-        cmd->pool = (VkPs4CommandPool *)pAllocateInfo->commandPool;
+        cmd->pool = pool;
         cmd->level = pAllocateInfo->level;
         cmd->is_recording = false;
         cmd->is_begin = false;
@@ -91,6 +103,11 @@ vk_ps4_AllocateCommandBuffers(VkDevice device, const VkCommandBufferAllocateInfo
         }
         cmd->pm4_used = 0;
 
+        /* Register in pool for cleanup */
+        if (pool && pool->command_buffer_count < VK_PS4_MAX_COMMAND_BUFFERS_PER_POOL) {
+            pool->command_buffers[pool->command_buffer_count++] = cmd;
+        }
+
         pCommandBuffers[i] = (VkCommandBuffer)cmd;
     }
     return VK_SUCCESS;
@@ -99,13 +116,31 @@ vk_ps4_AllocateCommandBuffers(VkDevice device, const VkCommandBufferAllocateInfo
 VKAPI_ATTR void VKAPI_CALL
 vk_ps4_FreeCommandBuffers(VkDevice device, VkCommandPool commandPool,
                           uint32_t commandBufferCount, const VkCommandBuffer *pCommandBuffers) {
-    (void)commandPool;
     if (!device || !pCommandBuffers) return;
     VkPs4Device *dev = (VkPs4Device *)device;
     const VkAllocationCallbacks *alloc = &dev->allocator;
+    VkPs4CommandPool *pool = (VkPs4CommandPool *)commandPool;
+
     for (uint32_t i = 0; i < commandBufferCount; i++) {
         if (!pCommandBuffers[i]) continue;
         VkPs4CommandBuffer *cmd = (VkPs4CommandBuffer *)pCommandBuffers[i];
+
+        /* Remove from pool's tracking array to avoid double-free in DestroyCommandPool */
+        if (pool) {
+            for (uint32_t j = 0; j < pool->command_buffer_count; j++) {
+                if (pool->command_buffers[j] == cmd) {
+                    pool->command_buffers[j] = NULL;
+                    /* Compact: move last element into the gap */
+                    if (j < pool->command_buffer_count - 1) {
+                        pool->command_buffers[j] = pool->command_buffers[pool->command_buffer_count - 1];
+                        pool->command_buffers[pool->command_buffer_count - 1] = NULL;
+                    }
+                    pool->command_buffer_count--;
+                    break;
+                }
+            }
+        }
+
         if (cmd->pm4_buffer) vk_ps4_free(alloc, cmd->pm4_buffer);
         vk_ps4_free(alloc, cmd);
     }
@@ -116,6 +151,7 @@ vk_ps4_BeginCommandBuffer(VkCommandBuffer commandBuffer, const VkCommandBufferBe
     (void)pBeginInfo;
     if (!commandBuffer) return VK_ERROR_INITIALIZATION_FAILED;
     VkPs4CommandBuffer *cmd = (VkPs4CommandBuffer *)commandBuffer;
+    if (!cmd->pm4_buffer) return VK_ERROR_INITIALIZATION_FAILED;
 
     /* Initialize GnmCommandBuffer with the PM4 buffer */
     cmd->gnm_cmd = sceGnmCmdInit(
@@ -128,8 +164,12 @@ vk_ps4_BeginCommandBuffer(VkCommandBuffer commandBuffer, const VkCommandBufferBe
     cmd->is_recording = true;
     cmd->is_begin = true;
     cmd->pm4_used = (uint32_t)(cmd->gnm_cmd.cmdptr - cmd->gnm_cmd.beginptr);
+    /* Reset all tracking state */
     cmd->current_pipeline = NULL;
     cmd->vertex_binding_count = 0;
+    memset(&cmd->index_buffer, 0, sizeof(cmd->index_buffer));
+    memset(cmd->vertex_buffers, 0, sizeof(cmd->vertex_buffers));
+    memset(&cmd->current_render_pass, 0, sizeof(cmd->current_render_pass));
 
     return VK_SUCCESS;
 }
@@ -148,10 +188,17 @@ vk_ps4_ResetCommandBuffer(VkCommandBuffer commandBuffer, VkCommandBufferResetFla
     (void)flags;
     if (!commandBuffer) return VK_ERROR_INITIALIZATION_FAILED;
     VkPs4CommandBuffer *cmd = (VkPs4CommandBuffer *)commandBuffer;
-    sceGnmCmdReset(&cmd->gnm_cmd);
+    if (cmd->pm4_buffer) {
+        sceGnmCmdReset(&cmd->gnm_cmd);
+    }
     cmd->pm4_used = 0;
     cmd->is_recording = false;
+    /* Reset all tracking state */
     cmd->current_pipeline = NULL;
+    cmd->vertex_binding_count = 0;
+    memset(&cmd->index_buffer, 0, sizeof(cmd->index_buffer));
+    memset(cmd->vertex_buffers, 0, sizeof(cmd->vertex_buffers));
+    memset(&cmd->current_render_pass, 0, sizeof(cmd->current_render_pass));
     return VK_SUCCESS;
 }
 
@@ -276,7 +323,7 @@ vk_ps4_CmdBindIndexBuffer(VkCommandBuffer commandBuffer, VkBuffer buffer, VkDevi
 
     /* Set index buffer in GNM */
     VkPs4Buffer *buf = (VkPs4Buffer *)buffer;
-    if (buf && buf->memory) {
+    if (buf && buf->memory && buf->memory->gnm_mem.mapped) {
         void *gpu_addr = (char *)buf->memory->gnm_mem.mapped + buf->memory_offset + offset;
         sceGnmDrawCmdSetIndexBuffer(&cmd->gnm_cmd, gpu_addr);
 
@@ -296,10 +343,8 @@ vk_ps4_CmdDraw(VkCommandBuffer commandBuffer, uint32_t vertexCount, uint32_t ins
     if (!commandBuffer) return;
     VkPs4CommandBuffer *cmd = (VkPs4CommandBuffer *)commandBuffer;
 
-    /* Set instance count */
-    if (instanceCount > 1) {
-        sceGnmDrawCmdSetNumInstances(&cmd->gnm_cmd, instanceCount);
-    }
+    /* Always set instance count to avoid state leak from previous draw */
+    sceGnmDrawCmdSetNumInstances(&cmd->gnm_cmd, instanceCount);
 
     /* DrawIndexAuto draws vertexCount vertices using auto-generated indices
      * starting from firstVertex. For firstVertex > 0, we need DrawIndexOffset
@@ -315,18 +360,17 @@ vk_ps4_CmdDrawIndexed(VkCommandBuffer commandBuffer, uint32_t indexCount, uint32
     if (!commandBuffer) return;
     VkPs4CommandBuffer *cmd = (VkPs4CommandBuffer *)commandBuffer;
 
-    if (instanceCount > 1) {
-        sceGnmDrawCmdSetNumInstances(&cmd->gnm_cmd, instanceCount);
-    }
+    /* Always set instance count to avoid state leak from previous draw */
+    sceGnmDrawCmdSetNumInstances(&cmd->gnm_cmd, instanceCount);
 
     /* If we have an index buffer bound, use DrawIndex */
     VkPs4Buffer *buf = (VkPs4Buffer *)cmd->index_buffer.buffer;
-    if (buf && buf->memory) {
+    if (buf && buf->memory && buf->memory->gnm_mem.mapped) {
         void *gpu_addr = (char *)buf->memory->gnm_mem.mapped + buf->memory_offset +
                          cmd->index_buffer.offset;
         /* Adjust for firstIndex based on index size */
         uint32_t index_stride = (cmd->index_buffer.type == VK_INDEX_TYPE_UINT32) ? 4 : 2;
-        void *index_addr = (char *)gpu_addr + firstIndex * index_stride;
+        void *index_addr = (char *)gpu_addr + (uint64_t)firstIndex * index_stride;
         sceGnmDrawCmdDrawIndex(&cmd->gnm_cmd, indexCount, index_addr);
     } else {
         /* Fallback: auto-draw */
@@ -370,20 +414,30 @@ vk_ps4_CmdDispatch(VkCommandBuffer commandBuffer, uint32_t x, uint32_t y, uint32
 VKAPI_ATTR void VKAPI_CALL
 vk_ps4_CmdCopyBuffer(VkCommandBuffer commandBuffer, VkBuffer srcBuffer, VkBuffer dstBuffer,
                      uint32_t regionCount, const VkBufferCopy *pRegions) {
-    if (!commandBuffer) return;
+    if (!commandBuffer || !pRegions) return;
     VkPs4CommandBuffer *cmd = (VkPs4CommandBuffer *)commandBuffer;
     VkPs4Buffer *src = (VkPs4Buffer *)srcBuffer;
     VkPs4Buffer *dst = (VkPs4Buffer *)dstBuffer;
 
     if (!src || !dst || !src->memory || !dst->memory) return;
+    if (!src->memory->gnm_mem.mapped || !dst->memory->gnm_mem.mapped) return;
 
     for (uint32_t i = 0; i < regionCount; i++) {
         uint64_t src_addr = (uint64_t)((char *)src->memory->gnm_mem.mapped +
                                         src->memory_offset + pRegions[i].srcOffset);
         uint64_t dst_addr = (uint64_t)((char *)dst->memory->gnm_mem.mapped +
                                         dst->memory_offset + pRegions[i].dstOffset);
-        sceGnmDrawCmdCopyMemory(&cmd->gnm_cmd, dst_addr, src_addr,
-                                (uint32_t)pRegions[i].size);
+        /* sceGnmDrawCmdCopyMemory takes uint32_t size — split large copies */
+        uint64_t remaining = pRegions[i].size;
+        uint64_t cur_src = src_addr;
+        uint64_t cur_dst = dst_addr;
+        while (remaining > 0) {
+            uint32_t chunk = (remaining > 0xFFFFFFFFu) ? 0xFFFFFFFFu : (uint32_t)remaining;
+            sceGnmDrawCmdCopyMemory(&cmd->gnm_cmd, cur_dst, cur_src, chunk);
+            cur_src += chunk;
+            cur_dst += chunk;
+            remaining -= chunk;
+        }
     }
 }
 
@@ -451,6 +505,8 @@ vk_ps4_CmdBeginRenderPass(VkCommandBuffer commandBuffer, const VkRenderPassBegin
     VkPs4CommandBuffer *cmd = (VkPs4CommandBuffer *)commandBuffer;
     VkPs4RenderPass *rp = (VkPs4RenderPass *)pBeginInfo->renderPass;
     VkPs4Framebuffer *fb = (VkPs4Framebuffer *)pBeginInfo->framebuffer;
+
+    if (!rp || !fb) return;
 
     cmd->current_render_pass.pass = rp;
     cmd->current_render_pass.framebuffer = fb;

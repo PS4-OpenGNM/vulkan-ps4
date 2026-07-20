@@ -57,9 +57,8 @@ vk_ps4_AllocateMemory(
         return VK_ERROR_FEATURE_NOT_PRESENT;
     }
 
-    /* Alignment: at least 64KB for GPU memory */
+    /* Alignment: 64KB for GPU memory (GNM direct memory requirement) */
     uint64_t alignment = 64 * 1024;
-    if (alignment < 4) alignment = 4;
 
     GnmError err = sceGnmDirectMemoryAllocate(
         &mem->gnm_mem, mem->size, alignment, gnm_memory_type, gnm_protection
@@ -109,11 +108,13 @@ vk_ps4_MapMemory(
         return VK_ERROR_MEMORY_MAP_FAILED;
     }
 
+    /* Bounds check with overflow safety */
+    if (offset > mem->size) {
+        return VK_ERROR_MEMORY_MAP_FAILED;
+    }
     if (size == VK_WHOLE_SIZE) {
         size = mem->size - offset;
-    }
-
-    if (offset + size > mem->size) {
+    } else if (size > mem->size - offset) {
         return VK_ERROR_MEMORY_MAP_FAILED;
     }
 

@@ -45,15 +45,21 @@ vk_ps4_WaitForFences(VkDevice device, uint32_t fenceCount, const VkFence *pFence
     (void)timeout;
     /* MVP: all fences are signaled immediately after QueueSubmit (synchronous submit).
      * Just check the signaled flag. */
+    uint32_t signaled_count = 0;
     for (uint32_t i = 0; i < fenceCount; i++) {
         if (!pFences[i]) continue;
         VkPs4Fence *f = (VkPs4Fence *)pFences[i];
-        if (!f->signaled) {
-            if (waitAll) return VK_TIMEOUT;
-            /* For wait-any, keep checking — but in MVP everything is synchronous */
+        if (f->signaled) {
+            signaled_count++;
         }
     }
-    return VK_SUCCESS;
+
+    if (waitAll) {
+        return (signaled_count == fenceCount) ? VK_SUCCESS : VK_TIMEOUT;
+    } else {
+        /* wait-any: succeed if at least one is signaled */
+        return (signaled_count > 0) ? VK_SUCCESS : VK_TIMEOUT;
+    }
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL

@@ -25,11 +25,11 @@ vk_ps4_CreateRenderPass(VkDevice device, const VkRenderPassCreateInfo *pCreateIn
     if (!rp) return VK_ERROR_OUT_OF_HOST_MEMORY;
     rp->type = VK_PS4_OBJ_RENDER_PASS;
     rp->device = dev;
-    rp->create_info = *pCreateInfo;
+    rp->create_info = *pCreateInfo;  /* shallow copy, pointers fixed below */
     rp->attachment_count = pCreateInfo->attachmentCount;
     rp->subpass_count = pCreateInfo->subpassCount;
 
-    /* Deep copy attachments */
+    /* Deep copy attachments and wire into create_info */
     if (rp->attachment_count > 0) {
         rp->attachments = vk_ps4_alloc_zero(alloc,
             rp->attachment_count * sizeof(VkAttachmentDescription), 16);
@@ -39,9 +39,13 @@ vk_ps4_CreateRenderPass(VkDevice device, const VkRenderPassCreateInfo *pCreateIn
         }
         memcpy(rp->attachments, pCreateInfo->pAttachments,
                rp->attachment_count * sizeof(VkAttachmentDescription));
+        rp->create_info.pAttachments = rp->attachments;
     }
 
-    /* Deep copy subpasses (simplified — just copy the top-level structs) */
+    /* Deep copy subpasses (top-level structs only — subpass internal pointers
+     * like pInputAttachments etc. still reference caller memory. For MVP
+     * triangle rendering we only use attachment_count and loadOp/storeOp,
+     * which are in the top-level attachment structs. Full deep copy is Phase 2.) */
     if (rp->subpass_count > 0) {
         rp->subpasses = vk_ps4_alloc_zero(alloc,
             rp->subpass_count * sizeof(VkSubpassDescription), 16);
@@ -52,7 +56,12 @@ vk_ps4_CreateRenderPass(VkDevice device, const VkRenderPassCreateInfo *pCreateIn
         }
         memcpy(rp->subpasses, pCreateInfo->pSubpasses,
                rp->subpass_count * sizeof(VkSubpassDescription));
+        rp->create_info.pSubpasses = rp->subpasses;
     }
+
+    /* Note: pDependencies is not deep-copied. Set to NULL to avoid dangling. */
+    rp->create_info.pDependencies = NULL;
+    rp->create_info.dependencyCount = 0;
 
     *pRenderPass = (VkRenderPass)rp;
     return VK_SUCCESS;
@@ -84,13 +93,13 @@ vk_ps4_CreateFramebuffer(VkDevice device, const VkFramebufferCreateInfo *pCreate
     fb->type = VK_PS4_OBJ_FRAMEBUFFER;
     fb->device = dev;
     fb->render_pass = (VkPs4RenderPass *)pCreateInfo->renderPass;
-    fb->create_info = *pCreateInfo;
+    fb->create_info = *pCreateInfo;  /* shallow copy, pointers fixed below */
     fb->attachment_count = pCreateInfo->attachmentCount;
     fb->width = pCreateInfo->width;
     fb->height = pCreateInfo->height;
     fb->layers = pCreateInfo->layers;
 
-    /* Store attachment image view pointers */
+    /* Store attachment image view pointers and wire into create_info */
     if (fb->attachment_count > 0) {
         fb->attachments = vk_ps4_alloc_zero(alloc,
             fb->attachment_count * sizeof(VkPs4ImageView *), 16);
@@ -101,6 +110,10 @@ vk_ps4_CreateFramebuffer(VkDevice device, const VkFramebufferCreateInfo *pCreate
         for (uint32_t i = 0; i < fb->attachment_count; i++) {
             fb->attachments[i] = (VkPs4ImageView *)pCreateInfo->pAttachments[i];
         }
+        /* Note: create_info.pAttachments still points to caller's VkImageView array.
+         * We don't use it after creation — we use fb->attachments instead.
+         * Null it out to avoid accidental UAF. */
+        fb->create_info.pAttachments = NULL;
     }
 
     *pFramebuffer = (VkFramebuffer)fb;

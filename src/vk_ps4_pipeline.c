@@ -68,7 +68,10 @@ vk_ps4_CreateGraphicsPipelines(VkDevice device, VkPipelineCache pipelineCache,
         memset(&pipe->ps_regs, 0, sizeof(pipe->ps_regs));
         memset(&pipe->cs_regs, 0, sizeof(pipe->cs_regs));
 
-        /* Store pipeline state */
+        /* Store pipeline state (shallow copy of structs — internal pointers
+         * like pVertexBindingDescriptions are NOT copied. For MVP we only
+         * use top-level fields like topology, polygonMode, etc. during
+         * CmdBindPipeline. Full deep copy is Phase 2.) */
         if (ci->pVertexInputState)
             pipe->vertex_input_state = *ci->pVertexInputState;
         if (ci->pInputAssemblyState)
@@ -86,6 +89,7 @@ vk_ps4_CreateGraphicsPipelines(VkDevice device, VkPipelineCache pipelineCache,
 
         /* Process shader stages */
         bool compile_ok = true;
+        bool vs_found = false, ps_found = false;
         for (uint32_t s = 0; s < ci->stageCount; s++) {
             const VkPipelineShaderStageCreateInfo *stage = &ci->pStages[s];
             VkPs4ShaderModule *mod = (VkPs4ShaderModule *)stage->module;
@@ -109,12 +113,14 @@ vk_ps4_CreateGraphicsPipelines(VkDevice device, VkPipelineCache pipelineCache,
                     const GnmVsShader *vs = (const GnmVsShader *)metadata.stage;
                     pipe->vs_regs = vs->registers;
                     pipe->vs_module = mod;
+                    vs_found = true;
                     break;
                 }
                 case VK_SHADER_STAGE_FRAGMENT_BIT: {
                     const GnmPsShader *ps = (const GnmPsShader *)metadata.stage;
                     pipe->ps_regs = ps->registers;
                     pipe->fs_module = mod;
+                    ps_found = true;
                     break;
                 }
                 case VK_SHADER_STAGE_GEOMETRY_BIT:
@@ -137,11 +143,17 @@ vk_ps4_CreateGraphicsPipelines(VkDevice device, VkPipelineCache pipelineCache,
             }
         }
 
-        if (!compile_ok) {
+        /* A graphics pipeline must have at least VS with valid registers */
+        if (!compile_ok || !vs_found) {
             vk_ps4_free(alloc, pipe);
             pPipelines[i] = VK_NULL_HANDLE;
             overall_result = VK_ERROR_FEATURE_NOT_PRESENT;
             continue;
+        }
+        /* PS is optional but if present must have valid registers */
+        if (!ps_found) {
+            /* Pipeline without fragment shader — may be used for depth-only.
+             * This is valid in Vulkan. PS regs stay zeroed. */
         }
 
         pPipelines[i] = (VkPipeline)pipe;
@@ -164,12 +176,14 @@ vk_ps4_CreateComputePipelines(VkDevice device, VkPipelineCache pipelineCache,
 
     VkPs4Device *dev = (VkPs4Device *)device;
     const VkAllocationCallbacks *alloc = pAllocator ? pAllocator : &dev->allocator;
+    VkResult overall_result = VK_SUCCESS;
 
     for (uint32_t i = 0; i < createInfoCount; i++) {
         const VkComputePipelineCreateInfo *ci = &pCreateInfos[i];
         VkPs4Pipeline *pipe = vk_ps4_alloc_zero(alloc, sizeof(*pipe), 16);
         if (!pipe) {
             pPipelines[i] = VK_NULL_HANDLE;
+            overall_result = VK_ERROR_OUT_OF_HOST_MEMORY;
             continue;
         }
         pipe->type = VK_PS4_OBJ_PIPELINE;
@@ -188,23 +202,34 @@ vk_ps4_CreateComputePipelines(VkDevice device, VkPipelineCache pipelineCache,
         if (vr != VK_SUCCESS) {
             vk_ps4_free(alloc, pipe);
             pPipelines[i] = VK_NULL_HANDLE;
+            overall_result = VK_ERROR_FEATURE_NOT_PRESENT;
             continue;
         }
 
+        bool cs_ok = false;
         if (metadata.fileheader && metadata.stage) {
-            /* Extract CS stage registers */
-            /* CS shader structure varies — store what we can */
+            /* Extract CS stage registers.
+             * GnmCsShader layout may differ — store the module and mark valid.
+             * Full CS register extraction is Phase 2. */
             pipe->cs_module = mod;
+            cs_ok = true;
         }
 
         if (binary && binary != mod->binary) {
             vk_ps4_free(alloc, binary);
         }
 
+        if (!cs_ok) {
+            vk_ps4_free(alloc, pipe);
+            pPipelines[i] = VK_NULL_HANDLE;
+            overall_result = VK_ERROR_FEATURE_NOT_PRESENT;
+            continue;
+        }
+
         pPipelines[i] = (VkPipeline)pipe;
     }
 
-    return VK_SUCCESS;
+    return overall_result;
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -306,6 +331,13 @@ vk_ps4_CreateDescriptorSetLayout(VkDevice device, const VkDescriptorSetLayoutCre
         }
         memcpy(layout->bindings, pCreateInfo->pBindings,
                layout->binding_count * sizeof(VkDescriptorSetLayoutBinding));
+        /* Null out pImmutableSamplers pointers in the copy — they dangle.
+         * Immutable samplers are Phase 2. */
+        for (uint32_t i = 0; i < layout->binding_count; i++) {
+            layout->bindings[i].pImmutableSamplers = NULL;
+        }
+        /* Wire deep-copied bindings into create_info */
+        layout->create_info.pBindings = layout->bindings;
     }
 
     *pSetLayout = (VkDescriptorSetLayout)layout;

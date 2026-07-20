@@ -34,16 +34,20 @@ vk_ps4_QueueSubmit(VkQueue queue, uint32_t submitCount, const VkSubmitInfo *pSub
             if (cmd_size_bytes == 0) continue;
 
             void *dcb_addr = cmd->pm4_buffer;
-            void *ccb_addr = NULL;  /* No constant command buffer for MVP */
 
-            /* Submit to GNM */
+            /* Submit to GNM — pass NULL for ccb_addrs and ccb_sizes
+             * since we don't use a separate constant command buffer. */
             int32_t result = sceGnmSubmitCommandBuffers(
-                1, &dcb_addr, &cmd_size_bytes, &ccb_addr, NULL
+                1, &dcb_addr, &cmd_size_bytes, NULL, NULL
             );
 
             if (result != 0) {
-                /* Submission failed */
-                return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+                /* Submission failed — signal fence to avoid deadlock */
+                if (fence) {
+                    VkPs4Fence *f = (VkPs4Fence *)fence;
+                    f->signaled = true;
+                }
+                return VK_ERROR_DEVICE_LOST;
             }
         }
 

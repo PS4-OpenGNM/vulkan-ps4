@@ -151,12 +151,16 @@ struct VkPs4Queue {
 
 /* === Command pool / buffer === */
 #define VK_PS4_MAX_VERTEX_BINDINGS 16
+#define VK_PS4_MAX_COMMAND_BUFFERS_PER_POOL 256
 
 struct VkPs4CommandPool {
     VkPs4ObjectType type;
     VkPs4Device *device;
     uint32_t queue_family_index;
     VkCommandPoolCreateFlags flags;
+    /* Track allocated command buffers for cleanup on DestroyCommandPool */
+    VkPs4CommandBuffer *command_buffers[VK_PS4_MAX_COMMAND_BUFFERS_PER_POOL];
+    uint32_t command_buffer_count;
 };
 
 struct VkPs4CommandBuffer {

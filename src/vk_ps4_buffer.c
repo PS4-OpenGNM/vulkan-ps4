@@ -63,7 +63,8 @@ vk_ps4_BindBufferMemory(VkDevice device, VkBuffer buffer, VkDeviceMemory memory,
     VkPs4Buffer *buf = (VkPs4Buffer *)buffer;
     VkPs4DeviceMemory *mem = (VkPs4DeviceMemory *)memory;
 
-    if (offset + buf->create_info.size > mem->size) {
+    /* Overflow-safe bounds check */
+    if (offset > mem->size || buf->create_info.size > mem->size - offset) {
         return VK_ERROR_OUT_OF_DEVICE_MEMORY;
     }
 
@@ -71,6 +72,9 @@ vk_ps4_BindBufferMemory(VkDevice device, VkBuffer buffer, VkDeviceMemory memory,
     buf->memory_offset = offset;
 
     /* Set up the GnmBuffer descriptor with the GPU address */
+    if (!mem->gnm_mem.mapped) {
+        return VK_ERROR_MEMORY_MAP_FAILED;
+    }
     void *gpu_addr = (char *)mem->gnm_mem.mapped + offset;
     sceGnmBufSetBaseAddress(&buf->gnm_buffer, gpu_addr);
 

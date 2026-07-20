@@ -51,6 +51,16 @@ vk_ps4_CreateImage(VkDevice device, const VkImageCreateInfo *pCreateInfo,
     GnmDataFormat gnm_fmt = vk_ps4_vk_format_to_gnm(pCreateInfo->format);
     GnmGpuMode gpu_mode = GNM_GPU_BASE;
 
+    /* Validate mipLevels — 0 means auto, clamp to 1 */
+    uint32_t mip_levels = pCreateInfo->mipLevels;
+    if (mip_levels == 0) mip_levels = 1;
+
+    /* Validate samples — PS4 supports up to 8x MSAA.
+     * VkSampleCountFlagBits is a bitfield (1,2,4,8,16). */
+    uint32_t samples = pCreateInfo->samples;
+    if (samples == 0) samples = 1;
+    if (samples > 8) samples = 8;  /* clamp to PS4 max */
+
     if (vk_image_is_color_target(pCreateInfo)) {
         /* Create as render target */
         img->is_render_target = true;
@@ -59,8 +69,8 @@ vk_ps4_CreateImage(VkDevice device, const VkImageCreateInfo *pCreateInfo,
             &rt_ci, gnm_fmt,
             pCreateInfo->extent.width, pCreateInfo->extent.height,
             pCreateInfo->arrayLayers,  /* numslices */
-            pCreateInfo->samples,      /* numsamples */
-            pCreateInfo->samples,      /* numfragments */
+            samples,                   /* numsamples */
+            samples,                   /* numfragments */
             GNM_TM_DISPLAY_2D_THIN,    /* tilemode */
             gpu_mode
         );
@@ -71,10 +81,26 @@ vk_ps4_CreateImage(VkDevice device, const VkImageCreateInfo *pCreateInfo,
             return VK_ERROR_OUT_OF_DEVICE_MEMORY;
         }
     } else if (vk_image_is_depth(pCreateInfo)) {
-        /* Depth/stencil target — for Phase 1, store minimal info.
-         * Full depth target support is Phase 3. */
-        img->is_render_target = true;
+        /* Depth/stencil target — for Phase 1, store as render target with
+         * zeroed descriptor. Full depth target (GnmDepthRenderTarget) support
+         * is Phase 3. Mark is_render_target=false so BindImageMemory and
+         * GetImageMemoryRequirements use the texture path as fallback. */
+        img->is_render_target = false;
         memset(&img->gnm_rt, 0, sizeof(img->gnm_rt));
+        /* Initialize a minimal texture descriptor for size calculation */
+        GnmTextureCreateInfo tex_ci;
+        memset(&tex_ci, 0, sizeof(tex_ci));
+        tex_ci.format = gnm_fmt;
+        tex_ci.texturetype = vk_image_type_to_gnm(pCreateInfo->imageType);
+        tex_ci.width = pCreateInfo->extent.width;
+        tex_ci.height = pCreateInfo->extent.height;
+        tex_ci.depth = pCreateInfo->extent.depth;
+        tex_ci.nummiplevels = mip_levels;
+        tex_ci.numslices = pCreateInfo->arrayLayers;
+        tex_ci.numfragments = 1;
+        tex_ci.tilemodehint = GNM_TM_DISPLAY_2D_THIN;
+        tex_ci.mingpumode = gpu_mode;
+        sceGnmCreateTexture(&img->gnm_texture, &tex_ci);
     } else {
         /* Create as texture */
         GnmTextureCreateInfo tex_ci;
@@ -84,7 +110,7 @@ vk_ps4_CreateImage(VkDevice device, const VkImageCreateInfo *pCreateInfo,
         tex_ci.width = pCreateInfo->extent.width;
         tex_ci.height = pCreateInfo->extent.height;
         tex_ci.depth = pCreateInfo->extent.depth;
-        tex_ci.nummiplevels = pCreateInfo->mipLevels;
+        tex_ci.nummiplevels = mip_levels;
         tex_ci.numslices = pCreateInfo->arrayLayers;
         tex_ci.numfragments = 1;
         tex_ci.tilemodehint = GNM_TM_DISPLAY_2D_THIN;
@@ -160,6 +186,11 @@ vk_ps4_BindImageMemory(VkDevice device, VkImage image, VkDeviceMemory memory, Vk
     img->memory = mem;
     img->memory_offset = offset;
 
+    if (!mem->gnm_mem.mapped) {
+        /* Cannot bind without a mapping — return error */
+        return VK_ERROR_MEMORY_MAP_FAILED;
+    }
+
     void *gpu_addr = (char *)mem->gnm_mem.mapped + offset;
 
     if (img->is_render_target) {
@@ -186,13 +217,18 @@ vk_ps4_CreateImageView(VkDevice device, const VkImageViewCreateInfo *pCreateInfo
     view->type = VK_PS4_OBJ_IMAGE_VIEW;
     view->device = dev;
     view->image = (VkPs4Image *)pCreateInfo->image;
+    if (!view->image) {
+        vk_ps4_free(alloc, view);
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
     view->create_info = *pCreateInfo;
 
     /* For render target images, the view is the same RT descriptor.
-     * For texture images, copy the texture descriptor (view = same for now). */
-    if (view->image->is_render_target) {
-        /* No separate view descriptor needed for render targets */
-    } else {
+     * For texture images, copy the texture descriptor.
+     * Note: if BindImageMemory hasn't been called yet, the descriptor
+     * has a zero base address. The view must be created after binding
+     * for correct GPU operation. This is a known limitation. */
+    if (!view->image->is_render_target) {
         view->gnm_view = view->image->gnm_texture;
     }
 
