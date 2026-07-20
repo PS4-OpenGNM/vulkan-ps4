@@ -167,8 +167,10 @@ vk_ps4_BeginCommandBuffer(VkCommandBuffer commandBuffer, const VkCommandBufferBe
     /* Reset all tracking state */
     cmd->current_pipeline = NULL;
     cmd->vertex_binding_count = 0;
+    cmd->vertex_buffers_dirty = false;
     memset(&cmd->index_buffer, 0, sizeof(cmd->index_buffer));
     memset(cmd->vertex_buffers, 0, sizeof(cmd->vertex_buffers));
+    memset(cmd->gnm_vertex_buffers, 0, sizeof(cmd->gnm_vertex_buffers));
     memset(&cmd->current_render_pass, 0, sizeof(cmd->current_render_pass));
 
     return VK_SUCCESS;
@@ -196,8 +198,10 @@ vk_ps4_ResetCommandBuffer(VkCommandBuffer commandBuffer, VkCommandBufferResetFla
     /* Reset all tracking state */
     cmd->current_pipeline = NULL;
     cmd->vertex_binding_count = 0;
+    cmd->vertex_buffers_dirty = false;
     memset(&cmd->index_buffer, 0, sizeof(cmd->index_buffer));
     memset(cmd->vertex_buffers, 0, sizeof(cmd->vertex_buffers));
+    memset(cmd->gnm_vertex_buffers, 0, sizeof(cmd->gnm_vertex_buffers));
     memset(&cmd->current_render_pass, 0, sizeof(cmd->current_render_pass));
     return VK_SUCCESS;
 }
@@ -236,6 +240,14 @@ vk_ps4_CmdBindPipeline(VkCommandBuffer commandBuffer, VkPipelineBindPoint pipeli
 
         /* Set pixel shader */
         sceGnmDrawCmdSetPsShader(&cmd->gnm_cmd, &pipe->ps_regs);
+
+        /* Bind fetch shader if the pipeline has one */
+        if (pipe->has_fetch_shader && pipe->fetch_shader) {
+            sceGnmDrawCmdSetPointerUserData(
+                &cmd->gnm_cmd, GNM_STAGE_VS, pipe->fetch_shader_slot,
+                pipe->fetch_shader
+            );
+        }
     } else if (pipelineBindPoint == VK_PIPELINE_BIND_POINT_COMPUTE) {
         sceGnmDrawCmdSetCsShader(&cmd->gnm_cmd, &pipe->cs_regs);
     }
@@ -291,11 +303,44 @@ vk_ps4_CmdBindVertexBuffers(VkCommandBuffer commandBuffer, uint32_t firstBinding
         if (idx < VK_PS4_MAX_VERTEX_BINDINGS) {
             cmd->vertex_buffers[idx].buffer = pBuffers[i];
             cmd->vertex_buffers[idx].offset = pOffsets ? pOffsets[i] : 0;
+
+            /* Build GnmBuffer descriptor for this vertex buffer */
+            VkPs4Buffer *vk_buf = (VkPs4Buffer *)pBuffers[i];
+            if (vk_buf && vk_buf->memory && vk_buf->memory->gnm_mem.mapped) {
+                void *gpu_addr = (char *)vk_buf->memory->gnm_mem.mapped +
+                                 vk_buf->memory_offset +
+                                 (pOffsets ? pOffsets[i] : 0);
+                /* Create a vertex buffer descriptor.
+                 * Format and stride will be set by the fetch shader based
+                 * on the vertex input layout. For now, use a raw buffer
+                 * with the stride from the vertex input binding. */
+                uint32_t stride = 0;
+                uint32_t num_elements = 0;
+                /* Get stride from pipeline vertex input state if available */
+                if (cmd->current_pipeline && cmd->current_pipeline->vertex_input_state.pVertexBindingDescriptions) {
+                    const VkPipelineVertexInputStateCreateInfo *vi =
+                        &cmd->current_pipeline->vertex_input_state;
+                    for (uint32_t b = 0; b < vi->vertexBindingDescriptionCount; b++) {
+                        if (vi->pVertexBindingDescriptions[b].binding == idx) {
+                            stride = vi->pVertexBindingDescriptions[b].stride;
+                            break;
+                        }
+                    }
+                }
+                if (stride == 0) stride = (uint32_t)vk_buf->create_info.size;
+                num_elements = (uint32_t)(vk_buf->create_info.size / stride);
+                cmd->gnm_vertex_buffers[idx] = sceGnmCreateVertexBuffer(
+                    gpu_addr, GNM_FMT_R32_FLOAT, stride, num_elements
+                );
+            } else {
+                memset(&cmd->gnm_vertex_buffers[idx], 0, sizeof(GnmBuffer));
+            }
         }
     }
     if (firstBinding + bindingCount > cmd->vertex_binding_count) {
         cmd->vertex_binding_count = firstBinding + bindingCount;
     }
+    cmd->vertex_buffers_dirty = true;
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -328,6 +373,18 @@ vk_ps4_CmdDraw(VkCommandBuffer commandBuffer, uint32_t vertexCount, uint32_t ins
     if (!commandBuffer) return;
     VkPs4CommandBuffer *cmd = (VkPs4CommandBuffer *)commandBuffer;
 
+    /* Emit vertex buffer table if dirty and pipeline has a VB table slot */
+    if (cmd->vertex_buffers_dirty && cmd->current_pipeline &&
+        cmd->current_pipeline->has_fetch_shader &&
+        cmd->vertex_binding_count > 0) {
+        sceGnmDrawCmdSetPointerUserData(
+            &cmd->gnm_cmd, GNM_STAGE_VS,
+            cmd->current_pipeline->vertex_buffer_table_slot,
+            cmd->gnm_vertex_buffers
+        );
+        cmd->vertex_buffers_dirty = false;
+    }
+
     /* Always set instance count to avoid state leak from previous draw */
     sceGnmDrawCmdSetNumInstances(&cmd->gnm_cmd, instanceCount);
 
@@ -344,6 +401,18 @@ vk_ps4_CmdDrawIndexed(VkCommandBuffer commandBuffer, uint32_t indexCount, uint32
                       uint32_t firstIndex, int32_t vertexOffset, uint32_t firstInstance) {
     if (!commandBuffer) return;
     VkPs4CommandBuffer *cmd = (VkPs4CommandBuffer *)commandBuffer;
+
+    /* Emit vertex buffer table if dirty and pipeline has a VB table slot */
+    if (cmd->vertex_buffers_dirty && cmd->current_pipeline &&
+        cmd->current_pipeline->has_fetch_shader &&
+        cmd->vertex_binding_count > 0) {
+        sceGnmDrawCmdSetPointerUserData(
+            &cmd->gnm_cmd, GNM_STAGE_VS,
+            cmd->current_pipeline->vertex_buffer_table_slot,
+            cmd->gnm_vertex_buffers
+        );
+        cmd->vertex_buffers_dirty = false;
+    }
 
     /* Always set instance count to avoid state leak from previous draw */
     sceGnmDrawCmdSetNumInstances(&cmd->gnm_cmd, instanceCount);

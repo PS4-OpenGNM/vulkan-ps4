@@ -189,6 +189,11 @@ struct VkPs4CommandBuffer {
         VkDeviceSize offset;
     } vertex_buffers[VK_PS4_MAX_VERTEX_BINDINGS];
     uint32_t vertex_binding_count;
+    /* GnmBuffer descriptors for bound vertex buffers — emitted to GPU
+     * via SetPointerUserData at the PTR_VERTEXBUFFERTABLE slot.
+     * This array must be in GPU-readable memory at draw time. */
+    GnmBuffer gnm_vertex_buffers[VK_PS4_MAX_VERTEX_BINDINGS];
+    bool vertex_buffers_dirty;  /* re-emit VB table on next draw */
     /* Bound index buffer */
     struct {
         VkBuffer buffer;
@@ -327,6 +332,10 @@ struct VkPs4Pipeline {
     void *fetch_shader;
     size_t fetch_shader_size;
     bool has_fetch_shader;
+    /* User-data slot for fetch shader pointer (SUBPTR_FETCHSHADER) */
+    uint32_t fetch_shader_slot;
+    /* User-data slot for vertex buffer table (PTR_VERTEXBUFFERTABLE) */
+    uint32_t vertex_buffer_table_slot;
     /* Input usage slot tables extracted from compiled shader binaries.
      * These map Vulkan binding numbers (apislot) to GNM user-data
      * registers (startregister) for each shader stage. */
@@ -334,6 +343,9 @@ struct VkPs4Pipeline {
     uint32_t vs_input_usage_slot_count;
     GnmInputUsageSlot ps_input_usage_slots[VK_PS4_MAX_INPUT_USAGE_SLOTS];
     uint32_t ps_input_usage_slot_count;
+    /* Vertex input semantics extracted from VS shader binary */
+    GnmVertexInputSemantic vs_input_semantics[VK_PS4_MAX_INPUT_USAGE_SLOTS];
+    uint32_t vs_input_semantic_count;
 };
 
 /* === Descriptor === */

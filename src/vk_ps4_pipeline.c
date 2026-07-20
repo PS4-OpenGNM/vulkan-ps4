@@ -123,6 +123,14 @@ vk_ps4_CreateGraphicsPipelines(VkDevice device, VkPipelineCache pipelineCache,
                         memcpy(pipe->vs_input_usage_slots, slots, nslots * sizeof(GnmInputUsageSlot));
                         pipe->vs_input_usage_slot_count = nslots;
                     }
+                    /* Extract vertex input semantics */
+                    uint32_t nsemantics = vs->numinputsemantics;
+                    if (nsemantics > VK_PS4_MAX_INPUT_USAGE_SLOTS) nsemantics = VK_PS4_MAX_INPUT_USAGE_SLOTS;
+                    const GnmVertexInputSemantic *semantics = sceGnmVsShaderInputSemanticTable(vs);
+                    if (semantics && nsemantics > 0) {
+                        memcpy(pipe->vs_input_semantics, semantics, nsemantics * sizeof(GnmVertexInputSemantic));
+                        pipe->vs_input_semantic_count = nsemantics;
+                    }
                     break;
                 }
                 case VK_SHADER_STAGE_FRAGMENT_BIT: {
@@ -167,6 +175,68 @@ vk_ps4_CreateGraphicsPipelines(VkDevice device, VkPipelineCache pipelineCache,
         if (!ps_found) {
             /* Pipeline without fragment shader — may be used for depth-only.
              * This is valid in Vulkan. PS regs stay zeroed. */
+        }
+
+        /* Generate fetch shader from VS input semantics + input usage slots.
+         * The fetch shader tells the GPU how to load vertex attributes from
+         * bound vertex buffers into VGPRs. */
+        if (pipe->vs_input_semantic_count > 0 && pipe->vs_input_usage_slot_count > 0) {
+            /* Find the fetch shader slot and vertex buffer table slot
+             * from the input usage slot table */
+            for (uint32_t s = 0; s < pipe->vs_input_usage_slot_count; s++) {
+                if (pipe->vs_input_usage_slots[s].usagetype == GNM_SHINPUTUSAGE_SUBPTR_FETCHSHADER) {
+                    pipe->fetch_shader_slot = pipe->vs_input_usage_slots[s].startregister;
+                } else if (pipe->vs_input_usage_slots[s].usagetype == GNM_SHINPUTUSAGE_PTR_VERTEXBUFFERTABLE) {
+                    pipe->vertex_buffer_table_slot = pipe->vs_input_usage_slots[s].startregister;
+                }
+            }
+
+            /* Build instancing modes from Vulkan vertex input binding descriptions */
+            GnmFetchShaderInstancingMode inst_modes[VK_PS4_MAX_VERTEX_BINDINGS];
+            uint32_t num_inst_modes = 0;
+            if (ci->pVertexInputState) {
+                const VkPipelineVertexInputStateCreateInfo *vi = ci->pVertexInputState;
+                num_inst_modes = vi->vertexBindingDescriptionCount;
+                if (num_inst_modes > VK_PS4_MAX_VERTEX_BINDINGS) num_inst_modes = VK_PS4_MAX_VERTEX_BINDINGS;
+                for (uint32_t b = 0; b < num_inst_modes; b++) {
+                    VkVertexInputRate rate = vi->pVertexBindingDescriptions[b].inputRate;
+                    inst_modes[b] = (rate == VK_VERTEX_INPUT_RATE_INSTANCE) ?
+                        GNM_FETCH_MODE_INSTANCEID : GNM_FETCH_MODE_VERTEXINDEX;
+                }
+            }
+
+            GnmFetchShaderCreateInfo fetch_ci = {0};
+            fetch_ci.regs = &pipe->vs_regs;
+            fetch_ci.vtxinputs = pipe->vs_input_semantics;
+            fetch_ci.numvtxinputs = pipe->vs_input_semantic_count;
+            fetch_ci.inputusages = pipe->vs_input_usage_slots;
+            fetch_ci.numinputusages = pipe->vs_input_usage_slot_count;
+            if (num_inst_modes > 0) {
+                fetch_ci.instancedata = inst_modes;
+                fetch_ci.numinstancedata = num_inst_modes;
+            }
+
+            uint32_t fetch_size = 0;
+            GnmError gerr = sceGnmFetchShaderCalcSize(&fetch_size, &fetch_ci);
+            if (gerr == GNM_ERROR_OK && fetch_size > 0) {
+                /* Allocate fetch shader (must be 256-byte aligned) */
+                pipe->fetch_shader = vk_ps4_alloc_zero(alloc, fetch_size, 256);
+                if (pipe->fetch_shader) {
+                    pipe->fetch_shader_size = fetch_size;
+                    GnmFetchShaderResults fetch_res = {0};
+                    gerr = sceGnmCreateFetchShader(
+                        pipe->fetch_shader, fetch_size, &fetch_ci, &fetch_res
+                    );
+                    if (gerr == GNM_ERROR_OK) {
+                        sceGnmVsRegsSetFetchShaderModifier(&pipe->vs_regs, &fetch_res);
+                        pipe->has_fetch_shader = true;
+                    } else {
+                        vk_ps4_free(alloc, pipe->fetch_shader);
+                        pipe->fetch_shader = NULL;
+                        pipe->fetch_shader_size = 0;
+                    }
+                }
+            }
         }
 
         pPipelines[i] = (VkPipeline)pipe;
