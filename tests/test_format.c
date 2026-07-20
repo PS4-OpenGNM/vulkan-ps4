@@ -164,6 +164,182 @@ int main(void) {
         fn = vkGetInstanceProcAddr(inst, "vkNonexistentFunction");
         CHECK(fn == NULL, "GetInstanceProcAddr returns NULL for unknown");
 
+        /* NULL pName should not crash */
+        fn = vkGetInstanceProcAddr(inst, NULL);
+        CHECK(fn == NULL, "GetInstanceProcAddr returns NULL for NULL pName");
+
+        /* Missing core functions should be found */
+        fn = vkGetInstanceProcAddr(inst, "vkCreateSampler");
+        CHECK(fn != NULL, "GetInstanceProcAddr finds vkCreateSampler");
+        fn = vkGetInstanceProcAddr(inst, "vkDestroySampler");
+        CHECK(fn != NULL, "GetInstanceProcAddr finds vkDestroySampler");
+        fn = vkGetInstanceProcAddr(inst, "vkResetCommandPool");
+        CHECK(fn != NULL, "GetInstanceProcAddr finds vkResetCommandPool");
+        fn = vkGetInstanceProcAddr(inst, "vkResetDescriptorPool");
+        CHECK(fn != NULL, "GetInstanceProcAddr finds vkResetDescriptorPool");
+        fn = vkGetInstanceProcAddr(inst, "vkTrimCommandPool");
+        CHECK(fn != NULL, "GetInstanceProcAddr finds vkTrimCommandPool");
+        fn = vkGetInstanceProcAddr(inst, "vkGetImageSubresourceLayout");
+        CHECK(fn != NULL, "GetInstanceProcAddr finds vkGetImageSubresourceLayout");
+        fn = vkGetInstanceProcAddr(inst, "vkCmdPushConstants");
+        CHECK(fn != NULL, "GetInstanceProcAddr finds vkCmdPushConstants");
+
+        vkDestroyInstance(inst, NULL);
+    }
+
+    /* Test: R5G5B5A1 channel order (was Bug 1 — channels were scrambled) */
+    {
+        GnmDataFormat fmt = vk_ps4_vk_format_to_gnm(VK_FORMAT_R5G5B5A1_UNORM_PACK16);
+        CHECK(fmt.surfacefmt == GNM_IMG_DATA_FORMAT_1_5_5_5, "R5G5B5A1 surface format");
+        CHECK(fmt.chanx == GNM_CHAN_X, "R5G5B5A1 chan X = X (R)");
+        CHECK(fmt.chany == GNM_CHAN_Y, "R5G5B5A1 chan Y = Y (G)");
+        CHECK(fmt.chanz == GNM_CHAN_Z, "R5G5B5A1 chan Z = Z (B)");
+        CHECK(fmt.chanw == GNM_CHAN_W, "R5G5B5A1 chan W = W (A)");
+    }
+
+    /* Test: D24_UNORM_S8_UINT (was Bug 2 — mapped to wrong 8_24 instead of 24_8) */
+    {
+        GnmDataFormat fmt = vk_ps4_vk_format_to_gnm(VK_FORMAT_D24_UNORM_S8_UINT);
+        CHECK(fmt.surfacefmt == GNM_IMG_DATA_FORMAT_24_8, "D24S8 surface format is 24_8 (not 8_24)");
+    }
+
+    /* Test: B5G6R5 channel swap */
+    {
+        GnmDataFormat fmt = vk_ps4_vk_format_to_gnm(VK_FORMAT_B5G6R5_UNORM_PACK16);
+        CHECK(fmt.surfacefmt == GNM_IMG_DATA_FORMAT_5_6_5, "B5G6R5 surface format");
+        CHECK(fmt.chanx == GNM_CHAN_Z, "B5G6R5 chan X = Z (B)");
+        CHECK(fmt.chany == GNM_CHAN_Y, "B5G6R5 chan Y = Y (G)");
+        CHECK(fmt.chanz == GNM_CHAN_X, "B5G6R5 chan Z = X (R)");
+    }
+
+    /* Test: B4G4R4A4 channel swap */
+    {
+        GnmDataFormat fmt = vk_ps4_vk_format_to_gnm(VK_FORMAT_B4G4R4A4_UNORM_PACK16);
+        CHECK(fmt.surfacefmt == GNM_IMG_DATA_FORMAT_4_4_4_4, "B4G4R4A4 surface format");
+        CHECK(fmt.chanx == GNM_CHAN_Z, "B4G4R4A4 chan X = Z (B)");
+        CHECK(fmt.chany == GNM_CHAN_Y, "B4G4R4A4 chan Y = Y (G)");
+        CHECK(fmt.chanz == GNM_CHAN_X, "B4G4R4A4 chan Z = X (R)");
+    }
+
+    /* Test: A2R10G10B10 channel swap */
+    {
+        GnmDataFormat fmt = vk_ps4_vk_format_to_gnm(VK_FORMAT_A2R10G10B10_UNORM_PACK32);
+        CHECK(fmt.surfacefmt == GNM_IMG_DATA_FORMAT_2_10_10_10, "A2R10G10B10 surface format");
+        CHECK(fmt.chanx == GNM_CHAN_Z, "A2R10G10B10 chan X = Z (B)");
+        CHECK(fmt.chany == GNM_CHAN_Y, "A2R10G10B10 chan Y = Y (G)");
+        CHECK(fmt.chanz == GNM_CHAN_X, "A2R10G10B10 chan Z = X (R)");
+    }
+
+    /* Test: Physical device handle stability (was Bug 4) */
+    {
+        VkInstance inst = VK_NULL_HANDLE;
+        VkInstanceCreateInfo ci = { .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO };
+        vkCreateInstance(&ci, NULL, &inst);
+
+        VkPhysicalDevice phys1 = VK_NULL_HANDLE, phys2 = VK_NULL_HANDLE;
+        uint32_t count = 1;
+        vkEnumeratePhysicalDevices(inst, &count, &phys1);
+        CHECK(phys1 != VK_NULL_HANDLE, "First EnumeratePhysicalDevices returns handle");
+        count = 1;
+        vkEnumeratePhysicalDevices(inst, &count, &phys2);
+        CHECK(phys2 == phys1, "Physical device handle is stable across calls");
+
+        vkDestroyInstance(inst, NULL);
+    }
+
+    /* Test: Queue handle stability (was Bug 5) */
+    {
+        VkInstance inst = VK_NULL_HANDLE;
+        VkInstanceCreateInfo ci = { .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO };
+        vkCreateInstance(&ci, NULL, &inst);
+        VkPhysicalDevice phys = VK_NULL_HANDLE;
+        uint32_t count = 1;
+        vkEnumeratePhysicalDevices(inst, &count, &phys);
+
+        float queue_priorities[] = {1.0f};
+        VkDeviceQueueCreateInfo qci = {
+            .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
+            .queueFamilyIndex = 0,
+            .queueCount = 1,
+            .pQueuePriorities = queue_priorities,
+        };
+        VkDeviceCreateInfo dci = {
+            .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
+            .pQueueCreateInfos = &qci,
+            .queueCreateInfoCount = 1,
+        };
+        VkDevice dev = VK_NULL_HANDLE;
+        vkCreateDevice(phys, &dci, NULL, &dev);
+
+        VkQueue q1 = VK_NULL_HANDLE, q2 = VK_NULL_HANDLE;
+        vkGetDeviceQueue(dev, 0, 0, &q1);
+        vkGetDeviceQueue(dev, 0, 0, &q2);
+        CHECK(q1 != VK_NULL_HANDLE, "First GetDeviceQueue returns handle");
+        CHECK(q1 == q2, "Queue handle is stable across calls");
+
+        vkDestroyDevice(dev, NULL);
+        vkDestroyInstance(inst, NULL);
+    }
+
+    /* Test: ShaderModule create+destroy (was Bug 6 — leak) */
+    {
+        VkInstance inst = VK_NULL_HANDLE;
+        VkInstanceCreateInfo ci = { .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO };
+        vkCreateInstance(&ci, NULL, &inst);
+        VkPhysicalDevice phys = VK_NULL_HANDLE;
+        uint32_t count = 1;
+        vkEnumeratePhysicalDevices(inst, &count, &phys);
+
+        float qp[] = {1.0f};
+        VkDeviceQueueCreateInfo qci = {
+            .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
+            .queueFamilyIndex = 0, .queueCount = 1, .pQueuePriorities = qp,
+        };
+        VkDeviceCreateInfo dci = {
+            .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
+            .pQueueCreateInfos = &qci, .queueCreateInfoCount = 1,
+        };
+        VkDevice dev = VK_NULL_HANDLE;
+        vkCreateDevice(phys, &dci, NULL, &dev);
+
+        uint32_t spirv[] = {0x07230203, 0x00010000, 0x00000000, 0x00000000};
+        VkShaderModuleCreateInfo smci = {
+            .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+            .codeSize = sizeof(spirv),
+            .pCode = spirv,
+        };
+        VkShaderModule mod = VK_NULL_HANDLE;
+        VkResult res = vkCreateShaderModule(dev, &smci, NULL, &mod);
+        CHECK(res == VK_SUCCESS, "CreateShaderModule succeeds");
+        CHECK(mod != VK_NULL_HANDLE, "ShaderModule handle valid");
+        vkDestroyShaderModule(dev, mod, NULL);
+
+        vkDestroyDevice(dev, NULL);
+        vkDestroyInstance(inst, NULL);
+    }
+
+    /* Test: Device extension enumeration (was Bug 11 — surface reported as device ext) */
+    {
+        VkInstance inst = VK_NULL_HANDLE;
+        VkInstanceCreateInfo ci = { .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO };
+        vkCreateInstance(&ci, NULL, &inst);
+        VkPhysicalDevice phys = VK_NULL_HANDLE;
+        uint32_t count = 1;
+        vkEnumeratePhysicalDevices(inst, &count, &phys);
+
+        uint32_t dev_ext_count = 0;
+        vkEnumerateDeviceExtensionProperties(phys, NULL, &dev_ext_count, NULL);
+        CHECK(dev_ext_count == 1, "Device extension count is 1 (only swapchain)");
+
+        VkExtensionProperties ext[4];
+        vkEnumerateDeviceExtensionProperties(phys, NULL, &dev_ext_count, ext);
+        CHECK(strcmp(ext[0].extensionName, VK_KHR_SWAPCHAIN_EXTENSION_NAME) == 0,
+              "Device extension is VK_KHR_swapchain");
+
+        uint32_t inst_ext_count = 0;
+        vkEnumerateInstanceExtensionProperties(NULL, &inst_ext_count, NULL);
+        CHECK(inst_ext_count == 1, "Instance extension count is 1 (only surface)");
+
         vkDestroyInstance(inst, NULL);
     }
 

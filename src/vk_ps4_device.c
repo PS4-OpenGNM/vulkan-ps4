@@ -28,8 +28,32 @@ vk_ps4_CreateDevice(
     dev->physical_device = phys;
     if (pAllocator) {
         dev->allocator = *pAllocator;
+    } else {
+        /* Inherit instance allocator so destroy uses the same one */
+        dev->allocator = phys->instance->allocator;
     }
     dev->gnm_initialized = false; /* TODO: init GNM on PS4 */
+
+    /* Pre-allocate queues from pCreateInfo so handles are stable */
+    dev->queue_count = 0;
+    for (uint32_t i = 0; i < pCreateInfo->queueCreateInfoCount; i++) {
+        const VkDeviceQueueCreateInfo *qci = &pCreateInfo->pQueueCreateInfos[i];
+        for (uint32_t j = 0; j < qci->queueCount && dev->queue_count < VK_PS4_MAX_QUEUES; j++) {
+            VkPs4Queue *queue = vk_ps4_alloc_zero(alloc, sizeof(*queue), 16);
+            if (!queue) {
+                /* Free already-allocated queues */
+                for (uint32_t k = 0; k < dev->queue_count; k++) {
+                    vk_ps4_free(alloc, dev->queues[k]);
+                }
+                vk_ps4_free(alloc, dev);
+                return VK_ERROR_OUT_OF_HOST_MEMORY;
+            }
+            queue->type = VK_PS4_OBJ_QUEUE;
+            queue->device = dev;
+            queue->family_index = qci->queueFamilyIndex;
+            dev->queues[dev->queue_count++] = queue;
+        }
+    }
 
     *pDevice = (VkDevice)dev;
     return VK_SUCCESS;
@@ -43,6 +67,14 @@ vk_ps4_DestroyDevice(VkDevice device, const VkAllocationCallbacks *pAllocator) {
     VkPs4Device *dev = (VkPs4Device *)device;
     const VkAllocationCallbacks *alloc = pAllocator ? pAllocator : &dev->allocator;
     /* TODO: tear down GNM state */
+    /* Free cached queues */
+    for (uint32_t i = 0; i < dev->queue_count; i++) {
+        if (dev->queues[i]) {
+            vk_ps4_free(alloc, dev->queues[i]);
+            dev->queues[i] = NULL;
+        }
+    }
+    dev->queue_count = 0;
     vk_ps4_free(alloc, dev);
 }
 
@@ -54,17 +86,16 @@ vk_ps4_GetDeviceQueue(
         return;
     }
     VkPs4Device *dev = (VkPs4Device *)device;
-    if (queueFamilyIndex != 0 || queueIndex != 0) {
-        *pQueue = VK_NULL_HANDLE;
-        return;
+    /* Return the cached queue handle (stable across calls) */
+    uint32_t idx = 0;
+    for (uint32_t i = 0; i < dev->queue_count; i++) {
+        if (dev->queues[i] && dev->queues[i]->family_index == queueFamilyIndex) {
+            if (idx == queueIndex) {
+                *pQueue = (VkQueue)dev->queues[i];
+                return;
+            }
+            idx++;
+        }
     }
-    VkPs4Queue *queue = vk_ps4_alloc_zero(&dev->allocator, sizeof(*queue), 16);
-    if (!queue) {
-        *pQueue = VK_NULL_HANDLE;
-        return;
-    }
-    queue->type = VK_PS4_OBJ_QUEUE;
-    queue->device = dev;
-    queue->family_index = 0;
-    *pQueue = (VkQueue)queue;
+    *pQueue = VK_NULL_HANDLE;
 }

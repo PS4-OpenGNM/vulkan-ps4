@@ -4,7 +4,7 @@
  * Maps Vulkan function names to implementation pointers.
  * vkGetInstanceProcAddr and vkGetDeviceProcAddr look up names here.
  *
- * Functions not yet implemented return VK_ERROR_NOT_IMPLEMENTED or are
+ * Functions not yet implemented return VK_ERROR_FEATURE_NOT_PRESENT or are
  * stubbed. As phases progress, stubs are replaced with real implementations.
  */
 
@@ -150,21 +150,21 @@ VKAPI_ATTR VkResult VKAPI_CALL vk_ps4_QueuePresentKHR(VkQueue, const VkPresentIn
 #define STUB_NOT_IMPL(name, rettype, retval) \
     VKAPI_ATTR rettype VKAPI_CALL name(void) { return retval; }
 
-/* Functions we haven't implemented yet — return VK_ERROR_NOT_IMPLEMENTED */
-STUB_NOT_IMPL(vk_ps4_EnumerateInstanceExtensionProperties, VkResult, VK_ERROR_NOT_IMPLEMENTED)
-STUB_NOT_IMPL(vk_ps4_EnumerateInstanceLayerProperties, VkResult, VK_ERROR_NOT_IMPLEMENTED)
-STUB_NOT_IMPL(vk_ps4_EnumerateDeviceExtensionProperties, VkResult, VK_ERROR_NOT_IMPLEMENTED)
-STUB_NOT_IMPL(vk_ps4_EnumerateDeviceLayerProperties, VkResult, VK_ERROR_NOT_IMPLEMENTED)
+/* Functions we haven't implemented yet — return VK_ERROR_FEATURE_NOT_PRESENT */
+STUB_NOT_IMPL(vk_ps4_EnumerateInstanceExtensionProperties, VkResult, VK_ERROR_FEATURE_NOT_PRESENT)
+STUB_NOT_IMPL(vk_ps4_EnumerateInstanceLayerProperties, VkResult, VK_ERROR_FEATURE_NOT_PRESENT)
+STUB_NOT_IMPL(vk_ps4_EnumerateDeviceExtensionProperties, VkResult, VK_ERROR_FEATURE_NOT_PRESENT)
+STUB_NOT_IMPL(vk_ps4_EnumerateDeviceLayerProperties, VkResult, VK_ERROR_FEATURE_NOT_PRESENT)
 STUB_NOT_IMPL(vk_ps4_GetPhysicalDeviceSparseImageFormatProperties, void, )
-STUB_NOT_IMPL(vk_ps4_GetPhysicalDeviceImageFormatProperties, VkResult, VK_ERROR_NOT_IMPLEMENTED)
+STUB_NOT_IMPL(vk_ps4_GetPhysicalDeviceImageFormatProperties, VkResult, VK_ERROR_FEATURE_NOT_PRESENT)
 STUB_NOT_IMPL(vk_ps4_GetBufferMemoryRequirements2, void, )
 STUB_NOT_IMPL(vk_ps4_GetImageMemoryRequirements2, void, )
-STUB_NOT_IMPL(vk_ps4_CreateBufferView, VkResult, VK_ERROR_NOT_IMPLEMENTED)
+STUB_NOT_IMPL(vk_ps4_CreateBufferView, VkResult, VK_ERROR_FEATURE_NOT_PRESENT)
 STUB_NOT_IMPL(vk_ps4_DestroyBufferView, void, )
-STUB_NOT_IMPL(vk_ps4_CreatePipelineCache, VkResult, VK_ERROR_NOT_IMPLEMENTED)
+STUB_NOT_IMPL(vk_ps4_CreatePipelineCache, VkResult, VK_ERROR_FEATURE_NOT_PRESENT)
 STUB_NOT_IMPL(vk_ps4_DestroyPipelineCache, void, )
-STUB_NOT_IMPL(vk_ps4_GetPipelineCacheData, VkResult, VK_ERROR_NOT_IMPLEMENTED)
-STUB_NOT_IMPL(vk_ps4_MergePipelineCaches, VkResult, VK_ERROR_NOT_IMPLEMENTED)
+STUB_NOT_IMPL(vk_ps4_GetPipelineCacheData, VkResult, VK_ERROR_FEATURE_NOT_PRESENT)
+STUB_NOT_IMPL(vk_ps4_MergePipelineCaches, VkResult, VK_ERROR_FEATURE_NOT_PRESENT)
 STUB_NOT_IMPL(vk_ps4_GetRenderAreaGranularity, void, )
 STUB_NOT_IMPL(vk_ps4_CmdSetLineWidth, void, )
 STUB_NOT_IMPL(vk_ps4_CmdSetDepthBias, void, )
@@ -189,7 +189,7 @@ STUB_NOT_IMPL(vk_ps4_GetDeviceMemoryCommitment, void, )
 STUB_NOT_IMPL(vk_ps4_GetImageSparseMemoryRequirements, void, )
 STUB_NOT_IMPL(vk_ps4_GetImageSparseMemoryRequirements2, void, )
 STUB_NOT_IMPL(vk_ps4_GetDeviceProcAddr, PFN_vkVoidFunction, NULL)
-STUB_NOT_IMPL(vk_ps4_QueueBindSparse, VkResult, VK_ERROR_NOT_IMPLEMENTED)
+STUB_NOT_IMPL(vk_ps4_QueueBindSparse, VkResult, VK_ERROR_FEATURE_NOT_PRESENT)
 STUB_NOT_IMPL(vk_ps4_GetPhysicalDeviceQueueFamilyProperties2, void, )
 
 /* === Name → function lookup table === */
@@ -287,6 +287,12 @@ static const VkPs4NameEntry g_device_funcs[] = {
     ENTRY(vkGetSwapchainImagesKHR),
     ENTRY(vkAcquireNextImageKHR),
     ENTRY(vkQueuePresentKHR),
+    ENTRY(vkCreateSampler),
+    ENTRY(vkDestroySampler),
+    ENTRY(vkResetCommandPool),
+    ENTRY(vkTrimCommandPool),
+    ENTRY(vkResetDescriptorPool),
+    ENTRY(vkGetImageSubresourceLayout),
     ENTRY(vkCreateBufferView),
     ENTRY(vkDestroyBufferView),
     ENTRY(vkCreatePipelineCache),
@@ -322,6 +328,7 @@ static const VkPs4NameEntry g_cmd_funcs[] = {
     ENTRY(vkCmdClearColorImage),
     ENTRY(vkCmdClearDepthStencilImage),
     ENTRY(vkCmdClearAttachments),
+    ENTRY(vkCmdPushConstants),
     ENTRY(vkCmdResetQueryPool),
     ENTRY(vkCmdBeginQuery),
     ENTRY(vkCmdEndQuery),
@@ -349,6 +356,7 @@ static const VkPs4NameEntry g_cmd_funcs[] = {
 VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL
 vkGetInstanceProcAddr(VkInstance instance, const char *pName) {
     (void)instance;
+    if (!pName) return NULL;
 
     /* Check instance-level functions */
     for (size_t i = 0; i < sizeof(g_instance_funcs) / sizeof(g_instance_funcs[0]); i++) {
@@ -385,6 +393,7 @@ vk_icdGetPhysicalDeviceProcAddr(VkInstance instance, const char *pName) {
 VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL
 vkGetDeviceProcAddr(VkDevice device, const char *pName) {
     (void)device;
+    if (!pName) return NULL;
 
     for (size_t i = 0; i < sizeof(g_device_funcs) / sizeof(g_device_funcs[0]); i++) {
         if (strcmp(g_device_funcs[i].name, pName) == 0) {

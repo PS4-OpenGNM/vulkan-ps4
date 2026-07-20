@@ -106,6 +106,7 @@ VKAPI_ATTR void VKAPI_CALL vkCmdPipelineBarrier(VkCommandBuffer a, VkPipelineSta
 VKAPI_ATTR void VKAPI_CALL vkCmdClearColorImage(VkCommandBuffer a, VkImage b, VkImageLayout c, const VkClearColorValue *d, uint32_t e, const VkImageSubresourceRange *f) { vk_ps4_CmdClearColorImage(a, b, c, d, e, f); }
 VKAPI_ATTR void VKAPI_CALL vkCmdClearDepthStencilImage(VkCommandBuffer a, VkImage b, VkImageLayout c, const VkClearDepthStencilValue *d, uint32_t e, const VkImageSubresourceRange *f) { vk_ps4_CmdClearDepthStencilImage(a, b, c, d, e, f); }
 VKAPI_ATTR void VKAPI_CALL vkCmdClearAttachments(VkCommandBuffer a, uint32_t b, const VkClearAttachment *c, uint32_t d, const VkClearRect *e) { vk_ps4_CmdClearAttachments(a, b, c, d, e); }
+VKAPI_ATTR void VKAPI_CALL vkCmdPushConstants(VkCommandBuffer a, VkPipelineLayout b, VkShaderStageFlags c, uint32_t d, uint32_t e, const void *f) { vk_ps4_CmdPushConstants(a, b, c, d, e, f); }
 
 /* === Queue === */
 VKAPI_ATTR VkResult VKAPI_CALL vkQueueSubmit(VkQueue a, uint32_t b, const VkSubmitInfo *c, VkFence d) { return vk_ps4_QueueSubmit(a, b, c, d); }
@@ -142,6 +143,20 @@ VKAPI_ATTR VkResult VKAPI_CALL vkGetSwapchainImagesKHR(VkDevice a, VkSwapchainKH
 VKAPI_ATTR VkResult VKAPI_CALL vkAcquireNextImageKHR(VkDevice a, VkSwapchainKHR b, uint64_t c, VkSemaphore d, VkFence e, uint32_t *f) { return vk_ps4_AcquireNextImageKHR(a, b, c, d, e, f); }
 VKAPI_ATTR VkResult VKAPI_CALL vkQueuePresentKHR(VkQueue a, const VkPresentInfoKHR *b) { return vk_ps4_QueuePresentKHR(a, b); }
 
+/* === Sampler === */
+VKAPI_ATTR VkResult VKAPI_CALL vkCreateSampler(VkDevice a, const VkSamplerCreateInfo *b, const VkAllocationCallbacks *c, VkSampler *d) { return vk_ps4_CreateSampler(a, b, c, d); }
+VKAPI_ATTR void VKAPI_CALL vkDestroySampler(VkDevice a, VkSampler b, const VkAllocationCallbacks *c) { vk_ps4_DestroySampler(a, b, c); }
+
+/* === Command pool management === */
+VKAPI_ATTR VkResult VKAPI_CALL vkResetCommandPool(VkDevice a, VkCommandPool b, VkCommandPoolResetFlags c) { return vk_ps4_ResetCommandPool(a, b, c); }
+VKAPI_ATTR void VKAPI_CALL vkTrimCommandPool(VkDevice a, VkCommandPool b, VkCommandPoolTrimFlags c) { vk_ps4_TrimCommandPool(a, b, c); }
+
+/* === Descriptor pool management === */
+VKAPI_ATTR VkResult VKAPI_CALL vkResetDescriptorPool(VkDevice a, VkDescriptorPool b, VkDescriptorPoolResetFlags c) { return vk_ps4_ResetDescriptorPool(a, b, c); }
+
+/* === Image subresource layout === */
+VKAPI_ATTR void VKAPI_CALL vkGetImageSubresourceLayout(VkDevice a, VkImage b, const VkImageSubresource *c, VkSubresourceLayout *d) { vk_ps4_GetImageSubresourceLayout(a, b, c, d); }
+
 /* === Enumerate (stubs) === */
 VKAPI_ATTR VkResult VKAPI_CALL vkEnumerateInstanceExtensionProperties(const char *a, uint32_t *b, VkExtensionProperties *c) {
     return vk_icdEnumerateInstanceExtensionProperties(a, b, c);
@@ -150,9 +165,8 @@ VKAPI_ATTR VkResult VKAPI_CALL vkEnumerateInstanceLayerProperties(uint32_t *a, V
     return vk_icdEnumerateInstanceLayerProperties(a, b);
 }
 VKAPI_ATTR VkResult VKAPI_CALL vkEnumerateDeviceExtensionProperties(VkPhysicalDevice a, const char *b, uint32_t *c, VkExtensionProperties *d) {
-    (void)a; (void)b;
-    /* Same as instance extensions for now */
-    return vk_icdEnumerateInstanceExtensionProperties(NULL, c, d);
+    (void)a;
+    return vk_ps4_enumerate_device_extensions(b, c, d);
 }
 VKAPI_ATTR VkResult VKAPI_CALL vkEnumerateDeviceLayerProperties(VkPhysicalDevice a, uint32_t *b, VkLayerProperties *c) {
     (void)a;

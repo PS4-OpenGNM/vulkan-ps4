@@ -18,6 +18,7 @@
 
 VKAPI_ATTR VkResult VKAPI_CALL
 vk_icdNegotiateLoaderICDInterfaceVersion(uint32_t *pVersion) {
+    if (!pVersion) return VK_ERROR_INITIALIZATION_FAILED;
     /* We support ICD interface version 5 (Vulkan 1.0 loader) */
     if (*pVersion >= 5) {
         *pVersion = 5;
@@ -26,29 +27,62 @@ vk_icdNegotiateLoaderICDInterfaceVersion(uint32_t *pVersion) {
     return VK_ERROR_INCOMPATIBLE_DRIVER;
 }
 
+/* Instance extensions: only VK_KHR_surface (platform surface is instance-level) */
+static const VkExtensionProperties g_instance_extensions[] = {
+    {VK_KHR_SURFACE_EXTENSION_NAME, 1},
+};
+static const uint32_t g_instance_ext_count =
+    sizeof(g_instance_extensions) / sizeof(g_instance_extensions[0]);
+
+/* Device extensions: only VK_KHR_swapchain (device-level) */
+static const VkExtensionProperties g_device_extensions[] = {
+    {VK_KHR_SWAPCHAIN_EXTENSION_NAME, 1},
+};
+static const uint32_t g_device_ext_count =
+    sizeof(g_device_extensions) / sizeof(g_device_extensions[0]);
+
 VKAPI_ATTR VkResult VKAPI_CALL
 vk_icdEnumerateInstanceExtensionProperties(
     const char *pLayerName, uint32_t *pPropertyCount, VkExtensionProperties *pProperties
 ) {
     (void)pLayerName;
 
-    /* We support one WSI extension: VK_KHR_swapchain (via VideoOut) */
-    static const VkExtensionProperties extensions[] = {
-        {VK_KHR_SURFACE_EXTENSION_NAME, 1},
-        {VK_KHR_SWAPCHAIN_EXTENSION_NAME, 1},
-    };
-    const uint32_t count = sizeof(extensions) / sizeof(extensions[0]);
-
     if (!pProperties) {
-        *pPropertyCount = count;
+        *pPropertyCount = g_instance_ext_count;
         return VK_SUCCESS;
     }
-    if (*pPropertyCount < count) {
-        *pPropertyCount = count;
+    uint32_t avail = *pPropertyCount;
+    if (avail < g_instance_ext_count) {
+        /* Write as many as fit */
+        memcpy(pProperties, g_instance_extensions,
+               avail * sizeof(VkExtensionProperties));
+        *pPropertyCount = g_instance_ext_count;
         return VK_INCOMPLETE;
     }
-    memcpy(pProperties, extensions, sizeof(extensions));
-    *pPropertyCount = count;
+    memcpy(pProperties, g_instance_extensions, sizeof(g_instance_extensions));
+    *pPropertyCount = g_instance_ext_count;
+    return VK_SUCCESS;
+}
+
+/* Device extension enumeration — used by vkEnumerateDeviceExtensionProperties */
+VKAPI_ATTR VkResult VKAPI_CALL
+vk_ps4_enumerate_device_extensions(
+    const char *pLayerName, uint32_t *pPropertyCount, VkExtensionProperties *pProperties
+) {
+    (void)pLayerName;
+    if (!pProperties) {
+        *pPropertyCount = g_device_ext_count;
+        return VK_SUCCESS;
+    }
+    uint32_t avail = *pPropertyCount;
+    if (avail < g_device_ext_count) {
+        memcpy(pProperties, g_device_extensions,
+               avail * sizeof(VkExtensionProperties));
+        *pPropertyCount = g_device_ext_count;
+        return VK_INCOMPLETE;
+    }
+    memcpy(pProperties, g_device_extensions, sizeof(g_device_extensions));
+    *pPropertyCount = g_device_ext_count;
     return VK_SUCCESS;
 }
 

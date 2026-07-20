@@ -46,12 +46,6 @@ extern "C" {
 #define VK_PS4_API_VERSION VK_MAKE_VERSION(1, 0, 0)
 #define VK_PS4_DRIVER_VERSION VK_MAKE_VERSION(0, 1, 0)
 
-/* VK_ERROR_NOT_IMPLEMENTED is not a standard Vulkan code.
- * We define it as a negative value in the implementation-specific range. */
-#ifndef VK_ERROR_NOT_IMPLEMENTED
-#define VK_ERROR_NOT_IMPLEMENTED ((VkResult)-1000500000)
-#endif
-
 /* === Memory types === */
 /* PS4 has two memory types:
  *   0 = Onion  (CPU-coherent, GPU-visible — for staging)
@@ -114,13 +108,13 @@ typedef struct VkPs4Semaphore VkPs4Semaphore;
 typedef struct VkPs4Event VkPs4Event;
 typedef struct VkPs4QueryPool VkPs4QueryPool;
 typedef struct VkPs4Swapchain VkPs4Swapchain;
-typedef struct VkPs4DispatchTable VkPs4DispatchTable;
 
 /* === Instance === */
 struct VkPs4Instance {
     VkPs4ObjectType type;
     VkInstanceCreateInfo create_info;
     VkAllocationCallbacks allocator;
+    VkPs4PhysicalDevice *physical_device;  /* cached, freed in DestroyInstance */
 };
 
 /* === Physical device === */
@@ -133,11 +127,15 @@ struct VkPs4PhysicalDevice {
 };
 
 /* === Device === */
+#define VK_PS4_MAX_QUEUES 16
 struct VkPs4Device {
     VkPs4ObjectType type;
     VkPs4PhysicalDevice *physical_device;
     VkDeviceCreateInfo create_info;
     VkAllocationCallbacks allocator;
+    /* Cached queues — allocated in CreateDevice, freed in DestroyDevice */
+    VkPs4Queue *queues[VK_PS4_MAX_QUEUES];
+    uint32_t queue_count;
     /* GNM state */
     bool gnm_initialized;
 };
@@ -374,121 +372,6 @@ struct VkPs4Swapchain {
     uint32_t current_image;
 };
 
-/* === Dispatch table === */
-/* The dispatch table is populated by vk_ps4_dispatch.c.
- * It maps Vulkan function names to our implementation pointers. */
-struct VkPs4DispatchTable {
-    PFN_vkGetInstanceProcAddr GetInstanceProcAddr;
-    PFN_vkGetDeviceProcAddr GetDeviceProcAddr;
-    /* Core Vulkan 1.0 functions — populated in vk_ps4_dispatch.c */
-    PFN_vkCreateInstance CreateInstance;
-    PFN_vkDestroyInstance DestroyInstance;
-    PFN_vkEnumeratePhysicalDevices EnumeratePhysicalDevices;
-    PFN_vkGetPhysicalDeviceProperties GetPhysicalDeviceProperties;
-    PFN_vkGetPhysicalDeviceMemoryProperties GetPhysicalDeviceMemoryProperties;
-    PFN_vkGetPhysicalDeviceQueueFamilyProperties GetPhysicalDeviceQueueFamilyProperties;
-    PFN_vkGetPhysicalDeviceFeatures GetPhysicalDeviceFeatures;
-    PFN_vkGetPhysicalDeviceFormatProperties GetPhysicalDeviceFormatProperties;
-    PFN_vkCreateDevice CreateDevice;
-    PFN_vkDestroyDevice DestroyDevice;
-    PFN_vkGetDeviceQueue GetDeviceQueue;
-    PFN_vkAllocateMemory AllocateMemory;
-    PFN_vkFreeMemory FreeMemory;
-    PFN_vkMapMemory MapMemory;
-    PFN_vkUnmapMemory UnmapMemory;
-    PFN_vkFlushMappedMemoryRanges FlushMappedMemoryRanges;
-    PFN_vkInvalidateMappedMemoryRanges InvalidateMappedMemoryRanges;
-    PFN_vkCreateBuffer CreateBuffer;
-    PFN_vkDestroyBuffer DestroyBuffer;
-    PFN_vkGetBufferMemoryRequirements GetBufferMemoryRequirements;
-    PFN_vkBindBufferMemory BindBufferMemory;
-    PFN_vkCreateImage CreateImage;
-    PFN_vkDestroyImage DestroyImage;
-    PFN_vkGetImageMemoryRequirements GetImageMemoryRequirements;
-    PFN_vkBindImageMemory BindImageMemory;
-    PFN_vkCreateImageView CreateImageView;
-    PFN_vkDestroyImageView DestroyImageView;
-    PFN_vkCreateRenderPass CreateRenderPass;
-    PFN_vkDestroyRenderPass DestroyRenderPass;
-    PFN_vkCreateFramebuffer CreateFramebuffer;
-    PFN_vkDestroyFramebuffer DestroyFramebuffer;
-    PFN_vkCreateShaderModule CreateShaderModule;
-    PFN_vkDestroyShaderModule DestroyShaderModule;
-    PFN_vkCreatePipelineLayout CreatePipelineLayout;
-    PFN_vkDestroyPipelineLayout DestroyPipelineLayout;
-    PFN_vkCreateGraphicsPipelines CreateGraphicsPipelines;
-    PFN_vkCreateComputePipelines CreateComputePipelines;
-    PFN_vkDestroyPipeline DestroyPipeline;
-    PFN_vkCreateDescriptorSetLayout CreateDescriptorSetLayout;
-    PFN_vkDestroyDescriptorSetLayout DestroyDescriptorSetLayout;
-    PFN_vkCreateDescriptorPool CreateDescriptorPool;
-    PFN_vkDestroyDescriptorPool DestroyDescriptorPool;
-    PFN_vkAllocateDescriptorSets AllocateDescriptorSets;
-    PFN_vkFreeDescriptorSets FreeDescriptorSets;
-    PFN_vkUpdateDescriptorSets UpdateDescriptorSets;
-    PFN_vkCreateCommandPool CreateCommandPool;
-    PFN_vkDestroyCommandPool DestroyCommandPool;
-    PFN_vkAllocateCommandBuffers AllocateCommandBuffers;
-    PFN_vkFreeCommandBuffers FreeCommandBuffers;
-    PFN_vkBeginCommandBuffer BeginCommandBuffer;
-    PFN_vkEndCommandBuffer EndCommandBuffer;
-    PFN_vkResetCommandBuffer ResetCommandBuffer;
-    PFN_vkCmdBindPipeline CmdBindPipeline;
-    PFN_vkCmdSetViewport CmdSetViewport;
-    PFN_vkCmdSetScissor CmdSetScissor;
-    PFN_vkCmdBindDescriptorSets CmdBindDescriptorSets;
-    PFN_vkCmdBindVertexBuffers CmdBindVertexBuffers;
-    PFN_vkCmdBindIndexBuffer CmdBindIndexBuffer;
-    PFN_vkCmdDraw CmdDraw;
-    PFN_vkCmdDrawIndexed CmdDrawIndexed;
-    PFN_vkCmdDrawIndirect CmdDrawIndirect;
-    PFN_vkCmdDrawIndexedIndirect CmdDrawIndexedIndirect;
-    PFN_vkCmdDispatch CmdDispatch;
-    PFN_vkCmdCopyBuffer CmdCopyBuffer;
-    PFN_vkCmdCopyImage CmdCopyImage;
-    PFN_vkCmdBlitImage CmdBlitImage;
-    PFN_vkCmdCopyBufferToImage CmdCopyBufferToImage;
-    PFN_vkCmdCopyImageToBuffer CmdCopyImageToBuffer;
-    PFN_vkCmdBeginRenderPass CmdBeginRenderPass;
-    PFN_vkCmdEndRenderPass CmdEndRenderPass;
-    PFN_vkCmdPipelineBarrier CmdPipelineBarrier;
-    PFN_vkCmdClearColorImage CmdClearColorImage;
-    PFN_vkCmdClearDepthStencilImage CmdClearDepthStencilImage;
-    PFN_vkCmdClearAttachments CmdClearAttachments;
-    PFN_vkQueueSubmit QueueSubmit;
-    PFN_vkQueueWaitIdle QueueWaitIdle;
-    PFN_vkDeviceWaitIdle DeviceWaitIdle;
-    PFN_vkCreateFence CreateFence;
-    PFN_vkDestroyFence DestroyFence;
-    PFN_vkWaitForFences WaitForFences;
-    PFN_vkResetFences ResetFences;
-    PFN_vkGetFenceStatus GetFenceStatus;
-    PFN_vkCreateSemaphore CreateSemaphore;
-    PFN_vkDestroySemaphore DestroySemaphore;
-    PFN_vkCreateEvent CreateEvent;
-    PFN_vkDestroyEvent DestroyEvent;
-    PFN_vkGetEventStatus GetEventStatus;
-    PFN_vkSetEvent SetEvent;
-    PFN_vkResetEvent ResetEvent;
-    PFN_vkCreateQueryPool CreateQueryPool;
-    PFN_vkDestroyQueryPool DestroyQueryPool;
-    PFN_vkGetQueryPoolResults GetQueryPoolResults;
-    PFN_vkCmdResetQueryPool CmdResetQueryPool;
-    PFN_vkCmdBeginQuery CmdBeginQuery;
-    PFN_vkCmdEndQuery CmdEndQuery;
-    PFN_vkCmdWriteTimestamp CmdWriteTimestamp;
-    /* WSI */
-    PFN_vkCreateSwapchainKHR CreateSwapchainKHR;
-    PFN_vkDestroySwapchainKHR DestroySwapchainKHR;
-    PFN_vkGetSwapchainImagesKHR GetSwapchainImagesKHR;
-    PFN_vkAcquireNextImageKHR AcquireNextImageKHR;
-    PFN_vkQueuePresentKHR QueuePresentKHR;
-};
-typedef struct VkPs4DispatchTable VkPs4DispatchTable;
-
-/* Global dispatch table — set up in vk_ps4_dispatch.c */
-extern VkPs4DispatchTable g_vk_ps4_dispatch;
-
 /* === Utility macros === */
 #define VK_PS4_CAST(handle) ((void*)(handle))
 #define VK_PS4_TO_OBJ(handle) ((VkPs4ObjectType*)(handle))
@@ -503,6 +386,11 @@ void vk_ps4_free(const VkAllocationCallbacks *alloc, void *ptr);
 /* === Format mapping === */
 GnmDataFormat vk_ps4_vk_format_to_gnm(VkFormat format);
 VkFormatProperties vk_ps4_format_properties(VkFormat format);
+
+/* === Device extension enumeration === */
+VkResult vk_ps4_enumerate_device_extensions(
+    const char *pLayerName, uint32_t *pPropertyCount, VkExtensionProperties *pProperties
+);
 
 /* === Stub shader (when libpsbc is not available) === */
 VkResult vk_ps4_shader_compile_stub(
@@ -608,6 +496,7 @@ VKAPI_ATTR void VKAPI_CALL vk_ps4_CmdPipelineBarrier(VkCommandBuffer, VkPipeline
 VKAPI_ATTR void VKAPI_CALL vk_ps4_CmdClearColorImage(VkCommandBuffer, VkImage, VkImageLayout, const VkClearColorValue *, uint32_t, const VkImageSubresourceRange *);
 VKAPI_ATTR void VKAPI_CALL vk_ps4_CmdClearDepthStencilImage(VkCommandBuffer, VkImage, VkImageLayout, const VkClearDepthStencilValue *, uint32_t, const VkImageSubresourceRange *);
 VKAPI_ATTR void VKAPI_CALL vk_ps4_CmdClearAttachments(VkCommandBuffer, uint32_t, const VkClearAttachment *, uint32_t, const VkClearRect *);
+VKAPI_ATTR void VKAPI_CALL vk_ps4_CmdPushConstants(VkCommandBuffer, VkPipelineLayout, VkShaderStageFlags, uint32_t, uint32_t, const void *);
 
 /* Queue */
 VKAPI_ATTR VkResult VKAPI_CALL vk_ps4_QueueSubmit(VkQueue, uint32_t, const VkSubmitInfo *, VkFence);
@@ -643,6 +532,20 @@ VKAPI_ATTR void VKAPI_CALL vk_ps4_DestroySwapchainKHR(VkDevice, VkSwapchainKHR, 
 VKAPI_ATTR VkResult VKAPI_CALL vk_ps4_GetSwapchainImagesKHR(VkDevice, VkSwapchainKHR, uint32_t *, VkImage *);
 VKAPI_ATTR VkResult VKAPI_CALL vk_ps4_AcquireNextImageKHR(VkDevice, VkSwapchainKHR, uint64_t, VkSemaphore, VkFence, uint32_t *);
 VKAPI_ATTR VkResult VKAPI_CALL vk_ps4_QueuePresentKHR(VkQueue, const VkPresentInfoKHR *);
+
+/* Sampler */
+VKAPI_ATTR VkResult VKAPI_CALL vk_ps4_CreateSampler(VkDevice, const VkSamplerCreateInfo *, const VkAllocationCallbacks *, VkSampler *);
+VKAPI_ATTR void VKAPI_CALL vk_ps4_DestroySampler(VkDevice, VkSampler, const VkAllocationCallbacks *);
+
+/* Command pool management */
+VKAPI_ATTR VkResult VKAPI_CALL vk_ps4_ResetCommandPool(VkDevice, VkCommandPool, VkCommandPoolResetFlags);
+VKAPI_ATTR void VKAPI_CALL vk_ps4_TrimCommandPool(VkDevice, VkCommandPool, VkCommandPoolTrimFlags);
+
+/* Descriptor pool management */
+VKAPI_ATTR VkResult VKAPI_CALL vk_ps4_ResetDescriptorPool(VkDevice, VkDescriptorPool, VkDescriptorPoolResetFlags);
+
+/* Image subresource layout */
+VKAPI_ATTR void VKAPI_CALL vk_ps4_GetImageSubresourceLayout(VkDevice, VkImage, const VkImageSubresource *, VkSubresourceLayout *);
 
 #ifdef __cplusplus
 }

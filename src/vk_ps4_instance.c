@@ -32,39 +32,10 @@ vk_ps4_CreateInstance(
         inst->allocator = *pAllocator;
     }
 
-    *pInstance = (VkInstance)inst;
-    return VK_SUCCESS;
-}
-
-VKAPI_ATTR void VKAPI_CALL
-vk_ps4_DestroyInstance(VkInstance instance, const VkAllocationCallbacks *pAllocator) {
-    if (!instance) {
-        return;
-    }
-    VkPs4Instance *inst = (VkPs4Instance *)instance;
-    const VkAllocationCallbacks *alloc = pAllocator ? pAllocator : &inst->allocator;
-    vk_ps4_free(alloc, inst);
-}
-
-VKAPI_ATTR VkResult VKAPI_CALL
-vk_ps4_EnumeratePhysicalDevices(
-    VkInstance instance, uint32_t *pPhysicalDeviceCount, VkPhysicalDevice *pPhysicalDevices
-) {
-    if (!instance || !pPhysicalDeviceCount) {
-        return VK_ERROR_INITIALIZATION_FAILED;
-    }
-    VkPs4Instance *inst = (VkPs4Instance *)instance;
-
-    if (!pPhysicalDevices) {
-        *pPhysicalDeviceCount = 1;
-        return VK_SUCCESS;
-    }
-    if (*pPhysicalDeviceCount < 1) {
-        return VK_INCOMPLETE;
-    }
-
-    VkPs4PhysicalDevice *phys = vk_ps4_alloc_zero(&inst->allocator, sizeof(*phys), 16);
+    /* Pre-allocate the single physical device so handles are stable */
+    VkPs4PhysicalDevice *phys = vk_ps4_alloc_zero(alloc, sizeof(*phys), 16);
     if (!phys) {
+        vk_ps4_free(alloc, inst);
         return VK_ERROR_OUT_OF_HOST_MEMORY;
     }
     phys->type = VK_PS4_OBJ_PHYSICAL_DEVICE;
@@ -79,30 +50,24 @@ vk_ps4_EnumeratePhysicalDevices(
     phys->properties.deviceType = VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU;
     strncpy(phys->properties.deviceName, g_device_name,
             sizeof(phys->properties.deviceName) - 1);
-    /* UUID — synthetic */
     memset(phys->properties.pipelineCacheUUID, 0, VK_UUID_SIZE);
 
     /* Memory properties: two heaps (Onion + Garlic) */
     memset(&phys->memory_properties, 0, sizeof(phys->memory_properties));
     phys->memory_properties.memoryTypeCount = VK_PS4_MEMORY_TYPE_COUNT;
-    /* Type 0: Onion (CPU-coherent) */
     phys->memory_properties.memoryTypes[VK_PS4_MEMORY_TYPE_ONION].propertyFlags =
         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
         VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
         VK_MEMORY_PROPERTY_HOST_CACHED_BIT |
         VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
     phys->memory_properties.memoryTypes[VK_PS4_MEMORY_TYPE_ONION].heapIndex = 0;
-    /* Type 1: Garlic (GPU-local, WC) */
     phys->memory_properties.memoryTypes[VK_PS4_MEMORY_TYPE_GARLIC].propertyFlags =
         VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
     phys->memory_properties.memoryTypes[VK_PS4_MEMORY_TYPE_GARLIC].heapIndex = 1;
-
     phys->memory_properties.memoryHeapCount = 2;
-    /* Onion: ~2GB available (conservative) */
     phys->memory_properties.memoryHeaps[0].size = 2ULL * 1024 * 1024 * 1024;
     phys->memory_properties.memoryHeaps[0].flags = 0;
-    /* Garlic: ~4GB GPU-local (conservative) */
     phys->memory_properties.memoryHeaps[1].size = 4ULL * 1024 * 1024 * 1024;
     phys->memory_properties.memoryHeaps[1].flags = VK_MEMORY_HEAP_DEVICE_LOCAL_BIT;
 
@@ -162,7 +127,46 @@ vk_ps4_EnumeratePhysicalDevices(
     phys->features.variableMultisampleRate = VK_TRUE;
     phys->features.inheritedQueries = VK_FALSE;
 
-    *pPhysicalDevices = (VkPhysicalDevice)phys;
+    inst->physical_device = phys;
+    *pInstance = (VkInstance)inst;
+    return VK_SUCCESS;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+vk_ps4_DestroyInstance(VkInstance instance, const VkAllocationCallbacks *pAllocator) {
+    if (!instance) {
+        return;
+    }
+    VkPs4Instance *inst = (VkPs4Instance *)instance;
+    const VkAllocationCallbacks *alloc = pAllocator ? pAllocator : &inst->allocator;
+    /* Free cached physical device */
+    if (inst->physical_device) {
+        vk_ps4_free(alloc, inst->physical_device);
+        inst->physical_device = NULL;
+    }
+    vk_ps4_free(alloc, inst);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+vk_ps4_EnumeratePhysicalDevices(
+    VkInstance instance, uint32_t *pPhysicalDeviceCount, VkPhysicalDevice *pPhysicalDevices
+) {
+    if (!instance || !pPhysicalDeviceCount) {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    VkPs4Instance *inst = (VkPs4Instance *)instance;
+
+    if (!pPhysicalDevices) {
+        *pPhysicalDeviceCount = 1;
+        return VK_SUCCESS;
+    }
+    if (*pPhysicalDeviceCount < 1) {
+        *pPhysicalDeviceCount = 1;
+        return VK_INCOMPLETE;
+    }
+
+    /* Return the cached physical device handle (stable across calls) */
+    *pPhysicalDevices = (VkPhysicalDevice)inst->physical_device;
     *pPhysicalDeviceCount = 1;
     return VK_SUCCESS;
 }

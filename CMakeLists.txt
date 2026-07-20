@@ -61,11 +61,13 @@ endif()
 
 # Vulkan ICD loader interface version
 add_compile_definitions(
-    VK_USE_PLATFORM_PS4
     VK_PS4_VERSION_MAJOR=1
     VK_PS4_VERSION_MINOR=0
     VK_PS4_VERSION_PATCH=0
 )
+if(VK_PS4_ORBIS)
+    add_compile_definitions(VK_USE_PLATFORM_PS4)
+endif()
 
 # ICD sources
 # As functions get real implementations, they move from vk_ps4_stubs.c
