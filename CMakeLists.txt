@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.15)
-project(vulkan_ps4 VERSION 0.1.0 LANGUAGES C)
+project(vulkan_ps4 VERSION 0.1.0 LANGUAGES C CXX)
 
 # vulkan-ps4 — Vulkan 1.0 ICD over OpenGNM
 #
@@ -79,6 +79,16 @@ set(VK_PS4_SOURCES
     src/vk_ps4_instance.c
     src/vk_ps4_device.c
     src/vk_ps4_format.c
+    src/vk_ps4_memory.c
+    src/vk_ps4_buffer.c
+    src/vk_ps4_image.c
+    src/vk_ps4_render_pass.c
+    src/vk_ps4_shader.c
+    src/vk_ps4_pipeline.c
+    src/vk_ps4_command.c
+    src/vk_ps4_swapchain.c
+    src/vk_ps4_queue.c
+    src/vk_ps4_sync.c
     src/vk_ps4_stubs.c
 )
 
@@ -108,7 +118,25 @@ else()
 endif()
 
 if(VK_PS4_HAVE_PSBC)
-    target_link_libraries(vulkan_ps4 PRIVATE psbc)
+    # Find the libpsbc static library
+    find_library(PSBC_LIBRARY
+        NAMES psbc
+        PATHS ${PSBC_ROOT}
+        NO_DEFAULT_PATH
+    )
+    if(PSBC_LIBRARY)
+        message(STATUS "Found libpsbc: ${PSBC_LIBRARY}")
+        target_link_libraries(vulkan_ps4 PRIVATE ${PSBC_LIBRARY})
+        # libpsbc is C++ (Mesa ACO) — need C++ standard library
+        if(APPLE)
+            target_link_libraries(vulkan_ps4 PRIVATE "-lc++")
+        else()
+            target_link_libraries(vulkan_ps4 PRIVATE "-lstdc++")
+        endif()
+    else()
+        message(STATUS "libpsbc.a not found — building without shader compilation (stub mode)")
+        set(VK_PS4_HAVE_PSBC OFF)
+    endif()
     target_compile_definitions(vulkan_ps4 PRIVATE VK_PS4_HAVE_PSBC=1)
 endif()
 
@@ -118,6 +146,12 @@ if(NOT VK_PS4_ORBIS)
     add_executable(vk_ps4_format_test tests/test_format.c)
     target_link_libraries(vk_ps4_format_test PRIVATE vulkan_ps4)
     add_test(NAME format_test COMMAND vk_ps4_format_test)
+
+    # Phase 1 triangle test — exercises full ICD pipeline
+    add_executable(vk_ps4_triangle_test tests/test_triangle.c)
+    target_link_libraries(vk_ps4_triangle_test PRIVATE vulkan_ps4)
+    add_test(NAME triangle_test COMMAND vk_ps4_triangle_test
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 endif()
 
 # Install
