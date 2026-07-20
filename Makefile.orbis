@@ -1,0 +1,153 @@
+# Makefile.orbis — vulkan-ps4 PS4 build with OpenOrbis toolchain
+#
+# Usage:
+#   export OO_PS4_TOOLCHAIN=/path/to/OpenOrbis-PS4-Toolchain
+#   make -f Makefile.orbis
+#
+# Prerequisites:
+#   - OpenOrbis PS4 Toolchain (OO_PS4_TOOLCHAIN)
+#   - opengnm built for orbis (../opengnm/libopengnm.a or build-orbis/)
+#   - libpsbc built (../opengnm-psbc/libpsbc.a)
+#   - Vulkan-Headers (../Vulkan-Headers/)
+#
+# Output:
+#   libvulkan_ps4.so — shared library for PS4
+#   libvulkan_ps4.a  — static library for PS4 (for static linking into apps)
+
+# === Toolchain ===
+ifeq ($(strip $(OO_PS4_TOOLCHAIN)),)
+$(error "Please set OO_PS4_TOOLCHAIN. export OO_PS4_TOOLCHAIN=<path to OpenOrbis-PS4-Toolchain>")
+endif
+
+# Paths to dependencies (sibling directories)
+OPENGNM_ROOT  ?= $(CURDIR)/../opengnm
+PSBC_ROOT     ?= $(CURDIR)/../opengnm-psbc
+VK_HEADERS    ?= $(CURDIR)/../Vulkan-Headers
+
+# Prefer the orbis-built libopengnm.a at the root, then build-orbis, then build
+OPENGNM_LIBDIR ?= $(firstword $(wildcard \
+    $(OPENGNM_ROOT) \
+    $(OPENGNM_ROOT)/build-orbis \
+    $(OPENGNM_ROOT)/build))
+
+UNAME_S := $(shell uname -s)
+ifeq ($(UNAME_S),Linux)
+	CC := clang
+	CXX := clang++
+	LD := ld.lld
+	AR := llvm-ar
+endif
+ifeq ($(UNAME_S),Darwin)
+	CC := clang
+	CXX := clang++
+	LD := ld.lld
+	AR := /opt/homebrew/opt/llvm/bin/llvm-ar
+endif
+
+# === Flags ===
+ARCHFLAGS := --target=x86_64-pc-freebsd12-elf -fPIC -DORBIS -D__ORBIS__ -D__PS4__
+
+INCDIRS := -I$(CURDIR)/include \
+           -I$(VK_HEADERS)/include \
+           -I$(OPENGNM_ROOT)/include \
+           -I$(PSBC_ROOT)/libpsbc \
+           -I$(PSBC_ROOT)/include \
+           -I$(OO_PS4_TOOLCHAIN)/include \
+           -I$(OO_PS4_TOOLCHAIN)/include/orbis
+
+DEFINES := -DVK_USE_PLATFORM_PS4
+# VK_PS4_HAVE_PSBC is not defined for orbis until libpsbc has an
+# orbis cross-compile target. The stub shader path is used instead.
+
+CFLAGS := $(ARCHFLAGS) $(INCDIRS) $(DEFINES) -std=c11 -O2 -g \
+          -Wall -Wextra -Wno-unused-function \
+          -Wno-macro-redefined -Wno-typedef-redefinition
+CXXFLAGS := $(ARCHFLAGS) $(INCDIRS) $(DEFINES) -std=c++17 -O2 -g \
+            -Wall -Wextra -Wno-unused-function \
+            -Wno-macro-redefined -Wno-typedef-redefinition
+
+# === Sources ===
+# Note: libpsbc is currently host-built (Mach-O). The orbis build uses
+# the stub shader path (VK_PS4_HAVE_PSBC not defined) until libpsbc
+# gets an orbis cross-compile target. The stub path stores SPIR-V
+# as-is and won't produce valid GCN shaders on PS4 — real shader
+# compilation requires the orbis-built libpsbc.
+VK_PS4_SRCS := \
+	src/vk_ps4_entry.c \
+	src/vk_ps4_dispatch.c \
+	src/vk_ps4_entrypoints.c \
+	src/vk_ps4_instance.c \
+	src/vk_ps4_device.c \
+	src/vk_ps4_format.c \
+	src/vk_ps4_memory.c \
+	src/vk_ps4_buffer.c \
+	src/vk_ps4_image.c \
+	src/vk_ps4_render_pass.c \
+	src/vk_ps4_shader.c \
+	src/vk_ps4_pipeline.c \
+	src/vk_ps4_descriptor.c \
+	src/vk_ps4_command.c \
+	src/vk_ps4_swapchain.c \
+	src/vk_ps4_queue.c \
+	src/vk_ps4_sync.c \
+	src/vk_ps4_query.c \
+	src/vk_ps4_stubs.c
+
+VK_PS4_OBJS := $(VK_PS4_SRCS:.c=.orbis.o)
+
+# === Output ===
+LIB_NAME := vulkan_ps4
+LIB_SHARED := lib$(LIB_NAME).so
+LIB_STATIC := lib$(LIB_NAME).a
+
+# === Link flags ===
+# Link against opengnm (orbis build), libpsbc, and OpenOrbis firmware stubs
+LIBDIRS := -L$(OPENGNM_LIBDIR) -L$(PSBC_ROOT) -L$(OO_PS4_TOOLCHAIN)/lib
+
+PS4_LIBS := -lkernel -lc -lc++ -lc++abi -lunwind \
+            -lSceGnmDriver -lSceVideoOut
+
+# opengnm (orbis-built). libpsbc not linked until it has an orbis target.
+DEP_LIBS := -lopengnm
+
+LDFLAGS_SHARED := -shared -m elf_x86_64 \
+                  --script $(OO_PS4_TOOLCHAIN)/link.x --eh-frame-hdr \
+                  -L$(OO_PS4_TOOLCHAIN)/lib $(LIBDIRS) \
+                  --gc-sections -z max-page-size=0x4000
+
+.PHONY: all clean static shared
+
+all: $(LIB_SHARED) $(LIB_STATIC)
+
+# === Build rules ===
+%.orbis.o: %.c
+	@echo "  CC $<"
+	@$(CC) $(CFLAGS) -c $< -o $@
+
+# === Static library ===
+$(LIB_STATIC): $(VK_PS4_OBJS)
+	@echo "  AR $@"
+	@$(AR) rcs $@ $(VK_PS4_OBJS)
+
+# === Shared library ===
+$(LIB_SHARED): $(VK_PS4_OBJS)
+	@echo "  LD $@"
+	@$(LD) $(LDFLAGS_SHARED) -o $@ $(VK_PS4_OBJS) \
+	    $(DEP_LIBS) $(PS4_LIBS)
+
+# === Clean ===
+clean:
+	rm -f $(VK_PS4_OBJS) $(LIB_SHARED) $(LIB_STATIC)
+
+# === Info ===
+info:
+	@echo "OO_PS4_TOOLCHAIN: $(OO_PS4_TOOLCHAIN)"
+	@echo "OPENGNM_ROOT: $(OPENGNM_ROOT)"
+	@echo "OPENGNM_LIBDIR: $(OPENGNM_LIBDIR)"
+	@echo "PSBC_ROOT: $(PSBC_ROOT)"
+	@echo "VK_HEADERS: $(VK_HEADERS)"
+	@echo "CC: $(CC)"
+	@echo "CFLAGS: $(CFLAGS)"
+	@echo "LD: $(LD)"
+	@echo "LDFLAGS_SHARED: $(LDFLAGS_SHARED)"
+	@echo "Sources: $(VK_PS4_SRCS)"

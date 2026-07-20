@@ -106,12 +106,29 @@ void *vk_ps4_alloc(const VkAllocationCallbacks *alloc, size_t size, size_t align
         return alloc->pfnAllocation(alloc->pUserData, size, alignment, VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
     }
     /* Default: aligned alloc */
+#if defined(_MSC_VER)
     if (alignment <= sizeof(void *)) {
         return malloc(size);
     }
-#if defined(_MSC_VER)
     return _aligned_malloc(size, alignment);
+#elif defined(__ORBIS__) || defined(__PS4__)
+    /* PS4 FreeBSD-based kernel doesn't expose posix_memalign.
+     * Always over-allocate and align manually, storing the raw
+     * pointer immediately before the aligned address so vk_ps4_free
+     * can recover it. This ensures a consistent free path regardless
+     * of alignment size. */
+    if (alignment < sizeof(void *)) {
+        alignment = sizeof(void *);
+    }
+    void *raw = malloc(size + alignment + sizeof(void *));
+    if (!raw) return NULL;
+    uintptr_t addr = ((uintptr_t)raw + sizeof(void *) + alignment - 1) & ~(uintptr_t)(alignment - 1);
+    ((void **)addr)[-1] = raw;
+    return (void *)addr;
 #else
+    if (alignment <= sizeof(void *)) {
+        return malloc(size);
+    }
     void *ptr = NULL;
     if (posix_memalign(&ptr, alignment, size) != 0) {
         return NULL;
@@ -138,6 +155,9 @@ void vk_ps4_free(const VkAllocationCallbacks *alloc, void *ptr) {
     }
 #if defined(_MSC_VER)
     _aligned_free(ptr);
+#elif defined(__ORBIS__) || defined(__PS4__)
+    /* Recover the original malloc pointer stored before the aligned address. */
+    free(((void **)ptr)[-1]);
 #else
     free(ptr);
 #endif
