@@ -299,21 +299,22 @@ static bool vk_ps4_rt_is_tiled(const GnmRenderTarget *rt) {
            tm != GNM_TM_DISPLAY_LINEAR_GENERAL;
 }
 
-/* Draw-based color clear is NOT implemented.
+/* Draw-based color clear for tiled RTs.
  *
  * The GNM_EMBEDDED_PSH_DUMMY shader has cbshadermask=0, meaning it writes
  * NO color output. Using it for a draw-based clear would be a no-op.
  * A proper draw-based clear requires a custom pixel shader that exports
- * the clear color (like the freegnm-examples clear.frag.sb shader).
+ * the clear color — this is implemented via vk_ps4_clear_color_draw which
+ * uses the embedded clear PS binary (clear_ps_binary.h, compiled from
+ * clear.frag). The clear PS reads vec4 color from a UBO at PS user data
+ * register 0 and outputs to MRT0.
  *
- * For now, all color clears use FillMemory, which writes linearly.
- * This is correct for linear RTs but INCORRECT for tiled RTs —
- * the tiled memory layout is not a simple linear sequence.
- * Tiled RT clears via FillMemory will corrupt the surface, but
- * subsequent rendering will overwrite the corrupted data.
- *
- * TODO: Embed a minimal clear pixel shader binary that reads a vec4
- * color from a user-data const buffer and exports it via EXP. */
+ * Linear RTs use FillMemory (fast, direct memory write).
+ * Tiled RTs use the draw-based clear (vk_ps4_clear_color_draw) which
+ * goes through the CB hardware and respects the tiled memory layout.
+ * Partial tiled RT ranges (sub-rect or multi-mip) still fall back to
+ * FillMemory as a known approximation — full per-mip draw-based clears
+ * are future work. */
 
 /* FillMemory-based color clear for a render target.
  * Works correctly for linear RTs. For tiled RTs, the data written
@@ -333,6 +334,101 @@ static void vk_ps4_clear_color_fillmem(GnmCommandBuffer *cmd,
     uint32_t rt_size = surface_w * surface_h * bpp;
     rt_size = (rt_size + 3) & ~3u;
     sceGnmDrawCmdFillMemory(cmd, rt_addr, rt_size, clear_val);
+}
+
+/* Draw-based color clear using the embedded clear pixel shader.
+ * This is the correct clear path for tiled render targets — FillMemory
+ * writes linearly and doesn't respect the tiled memory layout, but a
+ * draw-based clear goes through the CB hardware which handles tiling.
+ *
+ * The clear PS reads the clear color from a UBO (V# at user data
+ * register 0).  We allocate 16 bytes inside the command buffer via
+ * sceGnmCmdAllocInside, write the clear color there, build a GnmBuffer
+ * V# pointing to it, and set it via SetVsharpUserData.  Then we draw
+ * a fullscreen triangle with the embedded fullscreen VS. */
+static void vk_ps4_clear_color_draw(VkPs4CommandBuffer *cmd,
+                                     VkPs4Image *img,
+                                     const VkClearColorValue *cc) {
+    VkPs4Device *dev = cmd->device;
+    if (!dev || !dev->clear_ps_ready) {
+        /* No clear PS — fall back to FillMemory */
+        vk_ps4_clear_color_fillmem(&cmd->gnm_cmd, img, cc);
+        return;
+    }
+
+    /* Allocate 16 bytes inside the command buffer for the clear color.
+     * This is GPU-visible memory that the shader can read via the V#. */
+    void *color_buf = sceGnmCmdAllocInside(&cmd->gnm_cmd, 16, 4);
+    if (!color_buf) {
+        /* AllocInside failed — fall back to FillMemory */
+        vk_ps4_clear_color_fillmem(&cmd->gnm_cmd, img, cc);
+        return;
+    }
+    memcpy(color_buf, cc->float32, 16);
+
+    /* Build a const buffer V# pointing to the clear color.
+     * Use sceGnmCreateConstBuffer which sets stride=16, numrecords=1,
+     * format=R32G32B32A32_FLOAT — matching what the shader compiler
+     * generates for a vec4 UBO load (s_buffer_load_dwordx4). */
+    GnmBuffer vsharp = sceGnmCreateConstBuffer(color_buf, 16);
+
+    /* Set the V# at PS user data register 0 (IMM_CONSTBUFFER slot) */
+    sceGnmDrawCmdSetVsharpUserData(&cmd->gnm_cmd, GNM_STAGE_PS, 0, &vsharp);
+
+    /* Bind the RT being cleared at slot 0.  The clear PS outputs to
+     * MRT0, so the target must be at slot 0 regardless of which slot
+     * it was originally bound to by vk_ps4_bind_subpass_targets.
+     * The original bindings are restored after all clears by a
+     * re-call to vk_ps4_bind_subpass_targets. */
+    sceGnmDrawCmdSetRenderTarget(&cmd->gnm_cmd, 0, &img->gnm_rt);
+
+    /* Disable blending for RT0 so the clear color overwrites the RT
+     * instead of being blended with existing contents.  The previous
+     * pipeline's blend state is restored by vk_ps4_rebind_pipeline_state
+     * or the next CmdBindPipeline. */
+    GnmBlendControl no_blend;
+    memset(&no_blend, 0, sizeof(no_blend));
+    no_blend.blendenabled = false;
+    sceGnmDrawCmdSetBlendControl(&cmd->gnm_cmd, 0, &no_blend);
+
+    /* Set scissor to cover the full RT so the clear draw isn't clipped. */
+    sceGnmDrawCmdSetScreenScissor(&cmd->gnm_cmd,
+        0, 0,
+        img->create_info.extent.width,
+        img->create_info.extent.height);
+
+    /* Bind the clear pixel shader and fullscreen VS */
+    sceGnmDrawCmdSetPsShader(&cmd->gnm_cmd, &dev->clear_ps_regs);
+    sceGnmDrawCmdSetEmbeddedVsShader(&cmd->gnm_cmd, GNM_EMBEDDED_VSH_FULLSCREEN, 0);
+
+    /* Draw a fullscreen triangle to clear the entire RT.
+     * Reset instance count to 1 — VGT_INSTANCE_COUNT is sticky. */
+    sceGnmDrawCmdSetNumInstances(&cmd->gnm_cmd, 1);
+    sceGnmDrawCmdDrawIndexAuto(&cmd->gnm_cmd, 3);
+}
+
+/* Choose the appropriate color clear method based on the RT's tile mode.
+ * Linear RTs can use FillMemory (fast, direct memory write).
+ * Tiled RTs require a draw-based clear via the embedded clear PS. */
+static void vk_ps4_clear_color(VkPs4CommandBuffer *cmd,
+                                VkPs4Image *img,
+                                const VkClearColorValue *cc) {
+    if (img->is_render_target) {
+        /* Check if the RT is tiled by looking at the tile mode in the
+         * GnmRenderTarget descriptor.  Linear RTs (DISPLAY_LINEAR_GENERAL
+         * or THIN_LINEAR) can use FillMemory; everything else needs the
+         * draw-based clear. */
+        GnmTileMode tm = (GnmTileMode)img->gnm_rt.attrib.tilemode_index;
+        if (tm == GNM_TM_DISPLAY_LINEAR_GENERAL ||
+            tm == GNM_TM_DISPLAY_LINEAR_ALIGNED) {
+            vk_ps4_clear_color_fillmem(&cmd->gnm_cmd, img, cc);
+        } else {
+            vk_ps4_clear_color_draw(cmd, img, cc);
+        }
+    } else {
+        /* Non-RT image — use FillMemory */
+        vk_ps4_clear_color_fillmem(&cmd->gnm_cmd, img, cc);
+    }
 }
 
 /* Draw-based depth/stencil clear using embedded fullscreen VS + dummy PS.
@@ -367,6 +463,21 @@ static void vk_ps4_clear_depth_draw(GnmCommandBuffer *cmd) {
 /* Bind render targets for the current subpass.
  * Uses the subpass description's pColorAttachments to map framebuffer
  * attachment indices to RT slots, and pDepthStencilAttachment for depth. */
+/* Get the effective attachment view for a given index.
+ * For imageless framebuffers, uses the views from VkRenderPassAttachmentBeginInfo
+ * stored in cmd->current_render_pass.imageless_attachments.
+ * For regular framebuffers, uses fb->attachments. */
+static VkPs4ImageView *vk_ps4_get_attachment_view(VkPs4CommandBuffer *cmd, uint32_t att_idx) {
+    VkPs4Framebuffer *fb = cmd->current_render_pass.framebuffer;
+    if (!fb || att_idx >= fb->attachment_count) return NULL;
+    if (fb->imageless) {
+        if (att_idx >= cmd->current_render_pass.imageless_attachment_count)
+            return NULL;
+        return cmd->current_render_pass.imageless_attachments[att_idx];
+    }
+    return fb->attachments[att_idx];
+}
+
 static void vk_ps4_bind_subpass_targets(VkPs4CommandBuffer *cmd) {
     VkPs4RenderPass *rp = cmd->current_render_pass.pass;
     VkPs4Framebuffer *fb = cmd->current_render_pass.framebuffer;
@@ -381,9 +492,8 @@ static void vk_ps4_bind_subpass_targets(VkPs4CommandBuffer *cmd) {
         for (uint32_t j = 0; j < subpass->colorAttachmentCount && j < 8; j++) {
             uint32_t att_idx = subpass->pColorAttachments[j].attachment;
             if (att_idx == VK_ATTACHMENT_UNUSED) continue;
-            if (att_idx >= fb->attachment_count) continue;
 
-            VkPs4ImageView *view = fb->attachments[att_idx];
+            VkPs4ImageView *view = vk_ps4_get_attachment_view(cmd, att_idx);
             if (!view || !view->image) continue;
 
             if (view->image->is_render_target) {
@@ -395,8 +505,8 @@ static void vk_ps4_bind_subpass_targets(VkPs4CommandBuffer *cmd) {
     /* Bind depth/stencil attachment */
     if (subpass->pDepthStencilAttachment) {
         uint32_t att_idx = subpass->pDepthStencilAttachment->attachment;
-        if (att_idx != VK_ATTACHMENT_UNUSED && att_idx < fb->attachment_count) {
-            VkPs4ImageView *view = fb->attachments[att_idx];
+        if (att_idx != VK_ATTACHMENT_UNUSED) {
+            VkPs4ImageView *view = vk_ps4_get_attachment_view(cmd, att_idx);
             if (view && view->image && view->image->is_depth_target) {
                 sceGnmDrawCmdSetDepthRenderTarget(&cmd->gnm_cmd, &view->image->gnm_drt);
             }
@@ -1301,21 +1411,39 @@ vk_ps4_CmdDraw(VkCommandBuffer commandBuffer, uint32_t vertexCount, uint32_t ins
     /* Always set instance count to avoid state leak from previous draw */
     sceGnmDrawCmdSetNumInstances(&cmd->gnm_cmd, instanceCount);
 
-    /* For firstVertex > 0, we use DrawIndexAuto2 with a draw modifier.
-     * The actual vertex offset on GCN is handled via VGT_VERTEX_REUSE
-     * or shader user-data registers. For MVP, DrawIndexAuto2 with a
-     * zeroed modifier is used — firstVertex support requires shader
-     * cooperation (the shader reads gl_VertexIndex which includes
-     * firstVertex when set via user-data). */
-    GnmDrawModifier mod = {0};
-    if (firstVertex == 0 && firstInstance == 0) {
-        sceGnmDrawCmdDrawIndexAuto(&cmd->gnm_cmd, vertexCount);
-    } else {
-        /* Use DrawIndexAuto2 which accepts a draw modifier.
-         * firstVertex/firstInstance are passed to the shader via
-         * user-data registers set by the pipeline. */
-        sceGnmDrawCmdDrawIndexAuto2(&cmd->gnm_cmd, vertexCount, mod);
+    /* Emit firstVertex and firstInstance via SET_SH_REG to the
+     * user-data registers that psbc reserved for base_vertex and
+     * start_instance. The shader adds these to gl_VertexIndex and
+     * gl_InstanceIndex respectively.
+     * GCN user-data registers are sticky (persist across draws), so
+     * we must always write them when the pipeline uses them — even
+     * when the value is 0 — to avoid stale state from a previous draw. */
+    if (cmd->current_pipeline) {
+        VkPs4Pipeline *pipe = cmd->current_pipeline;
+        if (pipe->has_base_vertex_reg) {
+            uint32_t reg_addr = R_00B130_SPI_SHADER_USER_DATA_VS_0 +
+                                pipe->vs_base_vertex_reg * 4;
+            if ((uint32_t)(cmd->gnm_cmd.endptr - cmd->gnm_cmd.cmdptr) >= 3) {
+                cmd->gnm_cmd.cmdptr[0] = PKT3(PKT3_SET_SH_REG, 1, 0);
+                cmd->gnm_cmd.cmdptr[1] = (reg_addr - SI_SH_REG_OFFSET) >> 2;
+                cmd->gnm_cmd.cmdptr[2] = firstVertex;
+                cmd->gnm_cmd.cmdptr += 3;
+            }
+        }
+        if (pipe->has_start_instance_reg) {
+            uint32_t reg_addr = R_00B130_SPI_SHADER_USER_DATA_VS_0 +
+                                pipe->vs_start_instance_reg * 4;
+            if ((uint32_t)(cmd->gnm_cmd.endptr - cmd->gnm_cmd.cmdptr) >= 3) {
+                cmd->gnm_cmd.cmdptr[0] = PKT3(PKT3_SET_SH_REG, 1, 0);
+                cmd->gnm_cmd.cmdptr[1] = (reg_addr - SI_SH_REG_OFFSET) >> 2;
+                cmd->gnm_cmd.cmdptr[2] = firstInstance;
+                cmd->gnm_cmd.cmdptr += 3;
+            }
+        }
     }
+
+    GnmDrawModifier mod = {0};
+    sceGnmDrawCmdDrawIndexAuto2(&cmd->gnm_cmd, vertexCount, mod);
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -1340,6 +1468,36 @@ vk_ps4_CmdDrawIndexed(VkCommandBuffer commandBuffer, uint32_t indexCount, uint32
     /* Always set instance count to avoid state leak from previous draw */
     sceGnmDrawCmdSetNumInstances(&cmd->gnm_cmd, instanceCount);
 
+    /* Emit vertexOffset and firstInstance via SET_SH_REG BEFORE the draw.
+     * GCN user-data registers are read at draw time, so they must be
+     * written before the draw packet. They are also sticky (persist
+     * across draws), so we must always write them when the pipeline
+     * uses them — even when the value is 0 — to avoid stale state
+     * from a previous draw. */
+    if (cmd->current_pipeline) {
+        VkPs4Pipeline *pipe = cmd->current_pipeline;
+        if (pipe->has_base_vertex_reg) {
+            uint32_t reg_addr = R_00B130_SPI_SHADER_USER_DATA_VS_0 +
+                                pipe->vs_base_vertex_reg * 4;
+            if ((uint32_t)(cmd->gnm_cmd.endptr - cmd->gnm_cmd.cmdptr) >= 3) {
+                cmd->gnm_cmd.cmdptr[0] = PKT3(PKT3_SET_SH_REG, 1, 0);
+                cmd->gnm_cmd.cmdptr[1] = (reg_addr - SI_SH_REG_OFFSET) >> 2;
+                cmd->gnm_cmd.cmdptr[2] = (uint32_t)vertexOffset;
+                cmd->gnm_cmd.cmdptr += 3;
+            }
+        }
+        if (pipe->has_start_instance_reg) {
+            uint32_t reg_addr = R_00B130_SPI_SHADER_USER_DATA_VS_0 +
+                                pipe->vs_start_instance_reg * 4;
+            if ((uint32_t)(cmd->gnm_cmd.endptr - cmd->gnm_cmd.cmdptr) >= 3) {
+                cmd->gnm_cmd.cmdptr[0] = PKT3(PKT3_SET_SH_REG, 1, 0);
+                cmd->gnm_cmd.cmdptr[1] = (reg_addr - SI_SH_REG_OFFSET) >> 2;
+                cmd->gnm_cmd.cmdptr[2] = firstInstance;
+                cmd->gnm_cmd.cmdptr += 3;
+            }
+        }
+    }
+
     /* If we have an index buffer bound, use DrawIndex2 or DrawIndexOffset.
      * DrawIndexOffset takes an index offset (firstIndex) directly.
      * vertexOffset is handled by the shader via gl_VertexIndex user-data. */
@@ -1358,11 +1516,6 @@ vk_ps4_CmdDrawIndexed(VkCommandBuffer commandBuffer, uint32_t indexCount, uint32
         /* Fallback: auto-draw */
         sceGnmDrawCmdDrawIndexAuto(&cmd->gnm_cmd, indexCount);
     }
-    /* vertexOffset and firstInstance require shader cooperation —
-     * the shader reads gl_VertexIndex/gl_InstanceIndex which include
-     * these offsets when set via user-data registers. */
-    (void)vertexOffset;
-    (void)firstInstance;
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -1466,16 +1619,32 @@ vk_ps4_CmdDispatchIndirect(VkCommandBuffer commandBuffer, VkBuffer buffer, VkDev
      * Unlike DrawIndirect (which uses SetIndirectArgs + relative offset),
      * DISPATCH_INDIRECT takes a GPU memory address directly as the
      * dataoffset. The CP reads 3 uint32s (x, y, z) from that address.
-     * The address is 32-bit — PS4 GPU memory is mapped in the lower 4GB,
-     * so truncation is safe for all practical allocations. */
+     * The address is 32-bit. PS4 GPU memory is typically mapped in the
+     * lower 4GB, but if the buffer's address exceeds 32 bits we stage
+     * the 12-byte dispatch args inside the command buffer via
+     * sceGnmCmdAllocInside and dispatch from there. */
     uint64_t gpu_addr = (uint64_t)((char *)buf->memory->gnm_mem.mapped +
                                     buf->memory_offset + offset);
-    if (gpu_addr > 0xFFFFFFFFULL) {
-        /* Address doesn't fit in 32 bits — would need a staging buffer.
-         * For now, silently skip (should not happen on PS4). */
+    if (gpu_addr <= 0xFFFFFFFFULL) {
+        sceGnmDrawCmdDispatchIndirect(&cmd->gnm_cmd, (uint32_t)gpu_addr, 0);
         return;
     }
-    sceGnmDrawCmdDispatchIndirect(&cmd->gnm_cmd, (uint32_t)gpu_addr, 0);
+
+    /* Address > 32 bits: stage the 12-byte VkDispatchIndirectCommand into
+     * command buffer memory (which is always 32-bit addressable) and
+     * dispatch from the staging copy. */
+    void *src = (char *)buf->memory->gnm_mem.mapped + buf->memory_offset + offset;
+    void *staging = sceGnmCmdAllocInside(&cmd->gnm_cmd, 12, 4);
+    if (!staging) {
+        /* AllocInside failed — cannot dispatch. This is a driver-internal
+         * failure, not a spec violation. Log and skip rather than crash. */
+        return;
+    }
+    memcpy(staging, src, 12);
+    uint64_t staging_addr = (uint64_t)staging;
+    /* staging_addr comes from AllocInside which is always in the 32-bit
+     * command buffer address space, so the cast is safe. */
+    sceGnmDrawCmdDispatchIndirect(&cmd->gnm_cmd, (uint32_t)staging_addr, 0);
 }
 
 /* === Copy/blit commands (Phase 2) === */
@@ -1562,22 +1731,46 @@ vk_ps4_CmdUpdateBuffer(VkCommandBuffer commandBuffer, VkBuffer dstBuffer,
 
     /* CmdUpdateBuffer is limited to 65536 bytes per the Vulkan spec.
      *
-     * KNOWN LIMITATION: This implementation copies data immediately during
-     * command buffer recording, not at submit time. This is semantically
-     * incorrect — the Vulkan spec requires the update to happen when the
-     * command buffer is executed. The proper implementation would stage
-     * the data in a GPU-visible buffer embedded in the command buffer and
-     * emit a CopyMemory PM4 packet.
+     * Phase 3: Stage the data inside the command buffer via
+     * sceGnmCmdAllocInside, which embeds the data in the GPU-visible
+     * command buffer memory (wrapped in a NOP packet so the CP skips it).
+     * Then emit a CopyMemory to copy from the staging area to the
+     * destination at submit time.  This is semantically correct — the
+     * update happens when the command buffer is executed, not at record
+     * time.
      *
-     * This shortcut is safe when:
-     * - The destination buffer is not being read by the GPU
-     * - The caller doesn't modify pData between recording and submission
-     * - Garlic/onion memory is CPU-accessible (true on PS4)
-     *
-     * TODO: Implement proper staging via PM4 COPY_DATA or embedded staging. */
+     * Fallback: if AllocInside fails (command buffer full), fall back to
+     * the old CPU memcpy approach.  This is safe when the destination is
+     * not being read by the GPU. */
     uint64_t size = dataSize;
     if (size > 65536) size = 65536;  /* clamp to spec limit */
-    memcpy((void *)dst_addr, pData, size);
+    if (size == 0) return;
+
+    /* Round up to 4 bytes for AllocInside alignment. */
+    uint32_t alloc_size = (uint32_t)((size + 3) & ~3ull);
+    void *staging = sceGnmCmdAllocInside(&cmd->gnm_cmd, alloc_size, 4);
+    if (staging) {
+        /* Copy the caller's data into the staging area (CPU-visible
+         * command buffer memory), then emit a GPU copy from staging to
+         * the destination.  The copy executes at submit time. */
+        memcpy(staging, pData, (size_t)size);
+        uint64_t src_addr = (uint64_t)staging;
+        /* CopyMemory takes uint32_t size — split large copies. */
+        uint64_t remaining = size;
+        uint64_t cur_src = src_addr;
+        uint64_t cur_dst = dst_addr;
+        while (remaining > 0) {
+            uint32_t chunk = (remaining > 0xFFFFFFFFu) ? 0xFFFFFFFFu : (uint32_t)remaining;
+            sceGnmDrawCmdCopyMemory(&cmd->gnm_cmd, cur_dst, cur_src, chunk);
+            cur_src += chunk;
+            cur_dst += chunk;
+            remaining -= chunk;
+        }
+    } else {
+        /* Fallback: CPU memcpy at record time (semantically incorrect
+         * but safe when the GPU is not reading the destination). */
+        memcpy((void *)dst_addr, pData, (size_t)size);
+    }
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -1590,9 +1783,9 @@ vk_ps4_CmdCopyImage(VkCommandBuffer commandBuffer, VkImage srcImage, VkImageLayo
     VkPs4Image *dst = (VkPs4Image *)dstImage;
     if (!src || !dst) return;
 
-    /* For MVP, use CopyMemory for linear-to-linear image copies.
+    /* Linear-to-linear image copy via per-row CopyMemory.
      * Tiled texture copies require a shader-based blit or CP DMA with
-     * surface info — deferred to Phase 3. */
+     * surface info — deferred to a future shader-blit phase. */
     for (uint32_t i = 0; i < regionCount; i++) {
         const VkImageCopy *r = &pRegions[i];
 
@@ -1613,34 +1806,65 @@ vk_ps4_CmdCopyImage(VkCommandBuffer commandBuffer, VkImage srcImage, VkImageLayo
         uint32_t dst_pitch = vk_format_row_size(dst->create_info.format, dst_mip_w);
         uint32_t copy_width = vk_format_row_size(src->create_info.format, r->extent.width);
         uint32_t copy_height = compressed ? (r->extent.height + 3) / 4 : r->extent.height;
+        /* Depth/array slice count — iterate over all slices in the region.
+         * srcSubresource.layerCount == VK_REMAINING_ARRAY_LAYERS means copy
+         * all layers from baseArrayLayer to the image's layer count. */
+        uint32_t src_layers = r->srcSubresource.layerCount;
+        if (src_layers == VK_REMAINING_ARRAY_LAYERS) {
+            src_layers = src->create_info.arrayLayers - r->srcSubresource.baseArrayLayer;
+        }
+        uint32_t dst_layers = r->dstSubresource.layerCount;
+        if (dst_layers == VK_REMAINING_ARRAY_LAYERS) {
+            dst_layers = dst->create_info.arrayLayers - r->dstSubresource.baseArrayLayer;
+        }
+        uint32_t num_layers = (src_layers < dst_layers) ? src_layers : dst_layers;
+        if (num_layers == 0) num_layers = 1;
 
-        for (uint32_t y = 0; y < copy_height; y++) {
-            if (src->memory && dst->memory &&
-                src->memory->gnm_mem.mapped && dst->memory->gnm_mem.mapped) {
-                /* For compressed formats, offsets are in blocks (4x4).
-                 * srcOffset.x/y are in pixels, so divide by 4 for block offsets.
-                 * Use floor division — the spec requires block-aligned offsets. */
-                uint32_t src_x_bytes = compressed
-                    ? (r->srcOffset.x / 4) * bpp
-                    : r->srcOffset.x * bpp;
-                uint32_t dst_x_bytes = compressed
-                    ? (r->dstOffset.x / 4) * bpp
-                    : r->dstOffset.x * bpp;
-                uint32_t src_y_pitch = compressed
-                    ? ((r->srcOffset.y / 4) + y) * src_pitch
-                    : (r->srcOffset.y + y) * src_pitch;
-                uint32_t dst_y_pitch = compressed
-                    ? ((r->dstOffset.y / 4) + y) * dst_pitch
-                    : (r->dstOffset.y + y) * dst_pitch;
-                uint64_t src_addr = (uint64_t)src->memory->gnm_mem.mapped +
-                                    src->memory_offset +
-                                    (uint64_t)src_y_pitch +
-                                    (uint64_t)src_x_bytes;
-                uint64_t dst_addr = (uint64_t)dst->memory->gnm_mem.mapped +
-                                    dst->memory_offset +
-                                    (uint64_t)dst_y_pitch +
-                                    (uint64_t)dst_x_bytes;
-                sceGnmDrawCmdCopyMemory(&cmd->gnm_cmd, dst_addr, src_addr, copy_width);
+        /* Slice pitch: for 3D textures, each depth slice is a full 2D image.
+         * For array textures, each array layer is a full 2D image.
+         * For cubemaps, each face is a full 2D image.
+         * Memory layout: layer 0 depth 0, layer 0 depth 1, ..., layer 1 depth 0, ...
+         * So the offset for (layer, z) is ((baseArrayLayer + layer) * depth + z) * slice_size. */
+        uint64_t src_slice_size = (uint64_t)src_pitch * copy_height;
+        uint64_t dst_slice_size = (uint64_t)dst_pitch * copy_height;
+
+        for (uint32_t z = 0; z < r->extent.depth; z++) {
+            for (uint32_t layer = 0; layer < num_layers; layer++) {
+                uint64_t src_slice_off =
+                    (uint64_t)((r->srcSubresource.baseArrayLayer + layer) * r->extent.depth + z) * src_slice_size;
+                uint64_t dst_slice_off =
+                    (uint64_t)((r->dstSubresource.baseArrayLayer + layer) * r->extent.depth + z) * dst_slice_size;
+                for (uint32_t y = 0; y < copy_height; y++) {
+                    if (src->memory && dst->memory &&
+                        src->memory->gnm_mem.mapped && dst->memory->gnm_mem.mapped) {
+                        /* For compressed formats, offsets are in blocks (4x4).
+                         * srcOffset.x/y are in pixels, so divide by 4 for block offsets.
+                         * Use floor division — the spec requires block-aligned offsets. */
+                        uint32_t src_x_bytes = compressed
+                            ? (r->srcOffset.x / 4) * bpp
+                            : r->srcOffset.x * bpp;
+                        uint32_t dst_x_bytes = compressed
+                            ? (r->dstOffset.x / 4) * bpp
+                            : r->dstOffset.x * bpp;
+                        uint32_t src_y_pitch = compressed
+                            ? ((r->srcOffset.y / 4) + y) * src_pitch
+                            : (r->srcOffset.y + y) * src_pitch;
+                        uint32_t dst_y_pitch = compressed
+                            ? ((r->dstOffset.y / 4) + y) * dst_pitch
+                            : (r->dstOffset.y + y) * dst_pitch;
+                        uint64_t src_addr = (uint64_t)src->memory->gnm_mem.mapped +
+                                            src->memory_offset +
+                                            (uint64_t)src_y_pitch +
+                                            (uint64_t)src_x_bytes +
+                                            src_slice_off;
+                        uint64_t dst_addr = (uint64_t)dst->memory->gnm_mem.mapped +
+                                            dst->memory_offset +
+                                            (uint64_t)dst_y_pitch +
+                                            (uint64_t)dst_x_bytes +
+                                            dst_slice_off;
+                        sceGnmDrawCmdCopyMemory(&cmd->gnm_cmd, dst_addr, src_addr, copy_width);
+                    }
+                }
             }
         }
     }
@@ -1755,12 +1979,30 @@ vk_ps4_CmdCopyBufferToImage(VkCommandBuffer commandBuffer, VkBuffer srcBuffer, V
         uint64_t dst_base = (uint64_t)dst->memory->gnm_mem.mapped +
                             dst->memory_offset;
 
-        for (uint32_t y = 0; y < copy_height; y++) {
-            uint64_t src_addr = src_base + (uint64_t)y * src_pitch;
-            uint64_t dst_addr = dst_base +
-                                (uint64_t)(r->imageOffset.y + y) * dst_pitch +
-                                (uint64_t)r->imageOffset.x * bpp;
-            sceGnmDrawCmdCopyMemory(&cmd->gnm_cmd, dst_addr, src_addr, copy_width);
+        /* Iterate over depth slices and array layers.
+         * Buffer layout: layers are stacked, each containing all depth slices.
+         * Image layout: same — (layer * depth + z) * slice_size. */
+        uint32_t num_layers = r->imageSubresource.layerCount;
+        if (num_layers == VK_REMAINING_ARRAY_LAYERS) {
+            num_layers = dst->create_info.arrayLayers - r->imageSubresource.baseArrayLayer;
+        }
+        if (num_layers == 0) num_layers = 1;
+        uint64_t dst_slice_size = (uint64_t)dst_pitch * copy_height;
+        uint64_t src_slice_size = (uint64_t)src_pitch * copy_height;
+
+        for (uint32_t z = 0; z < r->imageExtent.depth; z++) {
+            for (uint32_t layer = 0; layer < num_layers; layer++) {
+                uint64_t src_slice_off = (uint64_t)(layer * r->imageExtent.depth + z) * src_slice_size;
+                uint64_t dst_slice_off =
+                    (uint64_t)((r->imageSubresource.baseArrayLayer + layer) * r->imageExtent.depth + z) * dst_slice_size;
+                for (uint32_t y = 0; y < copy_height; y++) {
+                    uint64_t src_addr = src_base + src_slice_off + (uint64_t)y * src_pitch;
+                    uint64_t dst_addr = dst_base + dst_slice_off +
+                                        (uint64_t)(r->imageOffset.y + y) * dst_pitch +
+                                        (uint64_t)r->imageOffset.x * bpp;
+                    sceGnmDrawCmdCopyMemory(&cmd->gnm_cmd, dst_addr, src_addr, copy_width);
+                }
+            }
         }
     }
     (void)dstImageLayout;
@@ -1794,12 +2036,30 @@ vk_ps4_CmdCopyImageToBuffer(VkCommandBuffer commandBuffer, VkImage srcImage, VkI
         uint64_t dst_base = (uint64_t)dst->memory->gnm_mem.mapped +
                             dst->memory_offset + r->bufferOffset;
 
-        for (uint32_t y = 0; y < copy_height; y++) {
-            uint64_t src_addr = src_base +
-                                (uint64_t)(r->imageOffset.y + y) * src_pitch +
-                                (uint64_t)r->imageOffset.x * bpp;
-            uint64_t dst_addr = dst_base + (uint64_t)y * dst_pitch;
-            sceGnmDrawCmdCopyMemory(&cmd->gnm_cmd, dst_addr, src_addr, copy_width);
+        /* Iterate over depth slices and array layers.
+         * Image layout: (layer * depth + z) * slice_size.
+         * Buffer layout: (layer * depth + z) * slice_size. */
+        uint32_t num_layers = r->imageSubresource.layerCount;
+        if (num_layers == VK_REMAINING_ARRAY_LAYERS) {
+            num_layers = src->create_info.arrayLayers - r->imageSubresource.baseArrayLayer;
+        }
+        if (num_layers == 0) num_layers = 1;
+        uint64_t src_slice_size = (uint64_t)src_pitch * copy_height;
+        uint64_t dst_slice_size = (uint64_t)dst_pitch * copy_height;
+
+        for (uint32_t z = 0; z < r->imageExtent.depth; z++) {
+            for (uint32_t layer = 0; layer < num_layers; layer++) {
+                uint64_t src_slice_off =
+                    (uint64_t)((r->imageSubresource.baseArrayLayer + layer) * r->imageExtent.depth + z) * src_slice_size;
+                uint64_t dst_slice_off = (uint64_t)(layer * r->imageExtent.depth + z) * dst_slice_size;
+                for (uint32_t y = 0; y < copy_height; y++) {
+                    uint64_t src_addr = src_base + src_slice_off +
+                                        (uint64_t)(r->imageOffset.y + y) * src_pitch +
+                                        (uint64_t)r->imageOffset.x * bpp;
+                    uint64_t dst_addr = dst_base + dst_slice_off + (uint64_t)y * dst_pitch;
+                    sceGnmDrawCmdCopyMemory(&cmd->gnm_cmd, dst_addr, src_addr, copy_width);
+                }
+            }
         }
     }
     (void)srcImageLayout;
@@ -1860,6 +2120,29 @@ vk_ps4_CmdBeginRenderPass(VkCommandBuffer commandBuffer, const VkRenderPassBegin
     cmd->current_render_pass.framebuffer = fb;
     cmd->current_render_pass.render_area = pBeginInfo->renderArea;
     cmd->current_render_pass.current_subpass = 0;
+
+    /* For imageless framebuffers, extract attachment views from
+     * VkRenderPassAttachmentBeginInfo in the pNext chain. */
+    cmd->current_render_pass.imageless_attachment_count = 0;
+    if (fb->imageless) {
+        VkBaseInStructure *chain = (VkBaseInStructure *)pBeginInfo->pNext;
+        while (chain) {
+            if (chain->sType == VK_STRUCTURE_TYPE_RENDER_PASS_ATTACHMENT_BEGIN_INFO) {
+                VkRenderPassAttachmentBeginInfo *att_begin =
+                    (VkRenderPassAttachmentBeginInfo *)chain;
+                uint32_t count = att_begin->attachmentCount;
+                if (count > 16) count = 16;
+                for (uint32_t i = 0; i < count; i++) {
+                    cmd->current_render_pass.imageless_attachments[i] =
+                        (VkPs4ImageView *)att_begin->pAttachments[i];
+                }
+                cmd->current_render_pass.imageless_attachment_count = count;
+                break;
+            }
+            chain = (VkBaseInStructure *)chain->pNext;
+        }
+    }
+
     /* Deep-copy clear values — the caller's pClearValues may be freed
      * after CmdBeginRenderPass returns, but CmdNextSubpass may need
      * them later for attachments first used in subsequent subpasses. */
@@ -1884,8 +2167,20 @@ vk_ps4_CmdBeginRenderPass(VkCommandBuffer commandBuffer, const VkRenderPassBegin
      * attachment via pDepthStencilAttachment. */
     vk_ps4_bind_subpass_targets(cmd);
 
-    /* Wait until safe for rendering on the video out handle */
-    /* TODO: if this is a swapchain render, call sceGnmDrawCmdWaitUntilSafeForRendering */
+    /* If any framebuffer attachment is a swapchain image, emit
+     * WaitUntilSafeForRendering so the GPU waits until the display
+     * engine has finished reading the buffer before we render to it.
+     * This prevents tearing and GPU/display races on swapchain images. */
+    for (uint32_t i = 0; i < fb->attachment_count; i++) {
+        VkPs4ImageView *view = vk_ps4_get_attachment_view(cmd, i);
+        if (view && view->image && view->image->is_swapchain_image) {
+            sceGnmDrawCmdWaitUntilSafeForRendering(
+                &cmd->gnm_cmd,
+                view->image->video_out_handle,
+                view->image->swapchain_buffer_index
+            );
+        }
+    }
 
     /* Clear attachments whose loadOp is CLEAR and that are first used
      * in subpass 0. Per the Vulkan spec, the load operation for each
@@ -1894,7 +2189,7 @@ vk_ps4_CmdBeginRenderPass(VkCommandBuffer commandBuffer, const VkRenderPassBegin
      * subpasses are cleared in CmdNextSubpass. */
     if (cmd->current_render_pass.clear_value_count > 0) {
         for (uint32_t i = 0; i < cmd->current_render_pass.clear_value_count && i < fb->attachment_count; i++) {
-            VkPs4ImageView *view = fb->attachments[i];
+            VkPs4ImageView *view = vk_ps4_get_attachment_view(cmd, i);
             if (!view || !view->image) continue;
 
             if (i >= rp->attachment_count) continue;
@@ -1936,10 +2231,17 @@ vk_ps4_CmdBeginRenderPass(VkCommandBuffer commandBuffer, const VkRenderPassBegin
             } else if (view->image->is_render_target) {
                 const VkClearColorValue *cc =
                     &cmd->current_render_pass.clear_values[i].color;
-                vk_ps4_clear_color_fillmem(&cmd->gnm_cmd, view->image, cc);
+                vk_ps4_clear_color(cmd, view->image, cc);
             }
         }
     }
+
+    /* Re-bind subpass targets after load-op clears.  Draw-based clears
+     * (vk_ps4_clear_color_draw) bind the cleared RT at slot 0 and clobber
+     * blend/scissor state.  Re-binding restores the correct RT-to-slot
+     * mapping from the subpass description.  Pipeline state (PS, VS,
+     * blend, scissor) is restored when the user calls CmdBindPipeline. */
+    vk_ps4_bind_subpass_targets(cmd);
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -2004,12 +2306,12 @@ vk_ps4_CmdNextSubpass(VkCommandBuffer commandBuffer, VkSubpassContents contents)
                 if (vk_ps4_attachment_used_before_subpass(rp, att_idx, next)) continue;
 
                 /* First use — clear it */
-                VkPs4ImageView *view = fb->attachments[att_idx];
+                VkPs4ImageView *view = vk_ps4_get_attachment_view(cmd, att_idx);
                 if (!view || !view->image || !view->image->is_render_target) continue;
                 if (att_idx < cmd->current_render_pass.clear_value_count) {
                     const VkClearColorValue *cc =
                         &cmd->current_render_pass.clear_values[att_idx].color;
-                    vk_ps4_clear_color_fillmem(&cmd->gnm_cmd, view->image, cc);
+                    vk_ps4_clear_color(cmd, view->image, cc);
                 }
             }
             /* Also check resolve attachments */
@@ -2021,12 +2323,12 @@ vk_ps4_CmdNextSubpass(VkCommandBuffer commandBuffer, VkSubpassContents contents)
                 if (rp->attachments[att_idx].loadOp != VK_ATTACHMENT_LOAD_OP_CLEAR) continue;
                 if (vk_ps4_attachment_used_before_subpass(rp, att_idx, next)) continue;
 
-                VkPs4ImageView *view = fb->attachments[att_idx];
+                VkPs4ImageView *view = vk_ps4_get_attachment_view(cmd, att_idx);
                 if (!view || !view->image || !view->image->is_render_target) continue;
                 if (att_idx < cmd->current_render_pass.clear_value_count) {
                     const VkClearColorValue *cc =
                         &cmd->current_render_pass.clear_values[att_idx].color;
-                    vk_ps4_clear_color_fillmem(&cmd->gnm_cmd, view->image, cc);
+                    vk_ps4_clear_color(cmd, view->image, cc);
                 }
             }
         }
@@ -2041,13 +2343,13 @@ vk_ps4_CmdNextSubpass(VkCommandBuffer commandBuffer, VkSubpassContents contents)
                 if (rp->attachments[att_idx].loadOp != VK_ATTACHMENT_LOAD_OP_CLEAR) continue;
                 if (vk_ps4_attachment_used_before_subpass(rp, att_idx, next)) continue;
 
-                VkPs4ImageView *view = fb->attachments[att_idx];
+                VkPs4ImageView *view = vk_ps4_get_attachment_view(cmd, att_idx);
                 if (!view || !view->image) continue;
                 if (view->image->is_render_target) {
                     if (att_idx < cmd->current_render_pass.clear_value_count) {
                         const VkClearColorValue *cc =
                             &cmd->current_render_pass.clear_values[att_idx].color;
-                        vk_ps4_clear_color_fillmem(&cmd->gnm_cmd, view->image, cc);
+                        vk_ps4_clear_color(cmd, view->image, cc);
                     }
                 } else if (view->image->is_depth_target) {
                     if (att_idx < cmd->current_render_pass.clear_value_count) {
@@ -2080,7 +2382,7 @@ vk_ps4_CmdNextSubpass(VkCommandBuffer commandBuffer, VkSubpassContents contents)
                 rp->attachments[att_idx].loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR &&
                 !vk_ps4_attachment_used_before_subpass(rp, att_idx, next)) {
 
-                VkPs4ImageView *view = fb->attachments[att_idx];
+                VkPs4ImageView *view = vk_ps4_get_attachment_view(cmd, att_idx);
                 if (view && view->image && view->image->is_depth_target) {
                     if (att_idx < cmd->current_render_pass.clear_value_count) {
                         const VkClearDepthStencilValue *ds =
@@ -2104,6 +2406,11 @@ vk_ps4_CmdNextSubpass(VkCommandBuffer commandBuffer, VkSubpassContents contents)
             }
         }
     }
+
+    /* Re-bind subpass targets after load-op clears.  Draw-based clears
+     * bind the cleared RT at slot 0 and clobber blend/scissor state.
+     * Re-binding restores the correct RT-to-slot mapping. */
+    vk_ps4_bind_subpass_targets(cmd);
 }
 
 /* === Barriers === */
@@ -2214,10 +2521,42 @@ vk_ps4_CmdClearColorImage(VkCommandBuffer commandBuffer, VkImage image, VkImageL
     VkPs4CommandBuffer *cmd = (VkPs4CommandBuffer *)commandBuffer;
     VkPs4Image *img = (VkPs4Image *)image;
 
-    /* FillMemory clear for all images (linear and tiled).
-     * TODO: Use a draw-based clear with a proper clear PS for tiled RTs. */
     if (!img->memory || !img->memory->gnm_mem.mapped) return;
 
+    /* Tiled render targets require a draw-based clear because FillMemory
+     * writes linearly and doesn't respect the tiled memory layout.
+     * vk_ps4_clear_color dispatches to the draw-based clear path for
+     * tiled RTs and FillMemory for linear images.
+     *
+     * The draw-based clear clears the full image at base mip level / layer 0.
+     * For multi-mip or multi-layer ranges on tiled RTs, we fall back to
+     * FillMemory (approximate — correct for linear, approximate for tiled).
+     * Full per-mip draw-based clears are future work. */
+    bool is_tiled_rt = false;
+    if (img->is_render_target) {
+        GnmTileMode tm = (GnmTileMode)img->gnm_rt.attrib.tilemode_index;
+        is_tiled_rt = (tm != GNM_TM_DISPLAY_LINEAR_GENERAL &&
+                       tm != GNM_TM_DISPLAY_LINEAR_ALIGNED);
+    }
+
+    /* Use draw-based clear for tiled RTs when the range covers the whole image. */
+    if (is_tiled_rt && rangeCount > 0) {
+        const VkImageSubresourceRange *range = &pRanges[0];
+        bool full_image = (rangeCount == 1 &&
+                           range->baseMipLevel == 0 &&
+                           (range->levelCount == VK_REMAINING_MIP_LEVELS ||
+                            range->levelCount == img->create_info.mipLevels) &&
+                           range->baseArrayLayer == 0 &&
+                           (range->layerCount == VK_REMAINING_ARRAY_LAYERS ||
+                            range->layerCount == img->create_info.arrayLayers));
+        if (full_image) {
+            vk_ps4_clear_color(cmd, img, pColor);
+            (void)imageLayout;
+            return;
+        }
+    }
+
+    /* Fall back to FillMemory for linear images and partial tiled RT ranges. */
     uint32_t bpp = vk_format_to_bpp(img->create_info.format);
     uint32_t clear_val = vk_ps4_pack_clear_val_32(img->create_info.format, pColor);
 
@@ -2464,13 +2803,79 @@ VKAPI_ATTR void VKAPI_CALL
 vk_ps4_CmdPushConstants(VkCommandBuffer commandBuffer, VkPipelineLayout layout,
                         VkShaderStageFlags stageFlags, uint32_t offset, uint32_t size,
                         const void *pValues) {
-    /* Phase 2: push constants via inline user data */
-    (void)commandBuffer;
+    if (!commandBuffer || !pValues || size == 0) return;
+    VkPs4CommandBuffer *cmd = (VkPs4CommandBuffer *)commandBuffer;
+    VkPs4Pipeline *pipe = cmd->current_pipeline;
+    if (!pipe) return;
+
+    /* Push constants are emitted via SET_SH_REG PM4 packets to write
+     * raw uint32_t values to the shader's user-data registers.
+     * The pipeline's push_const_slots table (populated from
+     * IMM_ALUFLOATCONST input usage slots) maps each push constant
+     * dword index to a user-data register. */
+    const uint32_t *values = (const uint32_t *)pValues;
+    uint32_t start_dword = offset / 4;
+    uint32_t end_dword = (offset + size + 3) / 4;
+
+    /* Helper to emit a single SET_SH_REG packet for one user-data reg. */
+    #define EMIT_PUSH_CONST_DWORD(gnm_cmd, reg_base, reg_idx, value, is_cs) do { \
+        uint32_t _addr = (reg_base) + (reg_idx) * 4; \
+        if ((uint32_t)((gnm_cmd)->endptr - (gnm_cmd)->cmdptr) < 3) { \
+            if ((gnm_cmd)->callback.func) \
+                (gnm_cmd)->callback.func(gnm_cmd, 3, (gnm_cmd)->callback.userdata); \
+            if ((uint32_t)((gnm_cmd)->endptr - (gnm_cmd)->cmdptr) < 3) break; \
+        } \
+        (gnm_cmd)->cmdptr[0] = PKT3(PKT3_SET_SH_REG, 1, 0) | \
+            ((is_cs) ? PKT3_SHADER_TYPE_S(1) : 0); \
+        (gnm_cmd)->cmdptr[1] = (_addr - SI_SH_REG_OFFSET) >> 2; \
+        (gnm_cmd)->cmdptr[2] = (value); \
+        (gnm_cmd)->cmdptr += 3; \
+    } while (0)
+
+    /* VS push constants */
+    if ((stageFlags & VK_SHADER_STAGE_VERTEX_BIT) && pipe->vs_push_const_slot_count > 0) {
+        for (uint32_t i = 0; i < pipe->vs_push_const_slot_count; i++) {
+            uint32_t dw_idx = pipe->vs_push_const_slots[i].dword_index;
+            if (dw_idx >= start_dword && dw_idx < end_dword) {
+                uint32_t val = values[dw_idx - start_dword];
+                EMIT_PUSH_CONST_DWORD(&cmd->gnm_cmd,
+                    R_00B130_SPI_SHADER_USER_DATA_VS_0,
+                    pipe->vs_push_const_slots[i].user_data_reg,
+                    val, false);
+            }
+        }
+    }
+
+    /* PS push constants */
+    if ((stageFlags & VK_SHADER_STAGE_FRAGMENT_BIT) && pipe->ps_push_const_slot_count > 0) {
+        for (uint32_t i = 0; i < pipe->ps_push_const_slot_count; i++) {
+            uint32_t dw_idx = pipe->ps_push_const_slots[i].dword_index;
+            if (dw_idx >= start_dword && dw_idx < end_dword) {
+                uint32_t val = values[dw_idx - start_dword];
+                EMIT_PUSH_CONST_DWORD(&cmd->gnm_cmd,
+                    R_00B030_SPI_SHADER_USER_DATA_PS_0,
+                    pipe->ps_push_const_slots[i].user_data_reg,
+                    val, false);
+            }
+        }
+    }
+
+    /* CS push constants */
+    if ((stageFlags & VK_SHADER_STAGE_COMPUTE_BIT) && pipe->cs_push_const_slot_count > 0) {
+        for (uint32_t i = 0; i < pipe->cs_push_const_slot_count; i++) {
+            uint32_t dw_idx = pipe->cs_push_const_slots[i].dword_index;
+            if (dw_idx >= start_dword && dw_idx < end_dword) {
+                uint32_t val = values[dw_idx - start_dword];
+                EMIT_PUSH_CONST_DWORD(&cmd->gnm_cmd,
+                    R_00B900_COMPUTE_USER_DATA_0,
+                    pipe->cs_push_const_slots[i].user_data_reg,
+                    val, true);
+            }
+        }
+    }
+
+    #undef EMIT_PUSH_CONST_DWORD
     (void)layout;
-    (void)stageFlags;
-    (void)offset;
-    (void)size;
-    (void)pValues;
 }
 
 /* Query commands moved to vk_ps4_query.c */

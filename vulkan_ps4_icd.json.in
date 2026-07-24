@@ -1,0 +1,8 @@
+{
+    "file_format_version": "1.0.0",
+    "ICD": {
+        "library_path": "@CMAKE_BINARY_DIR@/@CMAKE_SHARED_LIBRARY_PREFIX@vulkan_ps4@CMAKE_SHARED_LIBRARY_SUFFIX@",
+        "api_version": "1.1.0",
+        "is_portability_driver": true
+    }
+}

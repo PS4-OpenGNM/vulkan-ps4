@@ -103,7 +103,11 @@ VKAPI_ATTR void VKAPI_CALL vk_ps4_CmdBlitImage(VkCommandBuffer, VkImage, VkImage
 VKAPI_ATTR void VKAPI_CALL vk_ps4_CmdCopyBufferToImage(VkCommandBuffer, VkBuffer, VkImage, VkImageLayout, uint32_t, const VkBufferImageCopy *);
 VKAPI_ATTR void VKAPI_CALL vk_ps4_CmdCopyImageToBuffer(VkCommandBuffer, VkImage, VkImageLayout, VkBuffer, uint32_t, const VkBufferImageCopy *);
 VKAPI_ATTR void VKAPI_CALL vk_ps4_CmdBeginRenderPass(VkCommandBuffer, const VkRenderPassBeginInfo *, VkSubpassContents);
+VKAPI_ATTR void VKAPI_CALL vk_ps4_CmdNextSubpass(VkCommandBuffer, VkSubpassContents);
 VKAPI_ATTR void VKAPI_CALL vk_ps4_CmdEndRenderPass(VkCommandBuffer);
+VKAPI_ATTR void VKAPI_CALL vk_ps4_CmdBeginRenderPass2(VkCommandBuffer, const VkRenderPassBeginInfo *, const VkSubpassBeginInfo *);
+VKAPI_ATTR void VKAPI_CALL vk_ps4_CmdNextSubpass2(VkCommandBuffer, const VkSubpassBeginInfo *, const VkSubpassEndInfo *);
+VKAPI_ATTR void VKAPI_CALL vk_ps4_CmdEndRenderPass2(VkCommandBuffer, const VkSubpassEndInfo *);
 VKAPI_ATTR void VKAPI_CALL vk_ps4_CmdPipelineBarrier(VkCommandBuffer, VkPipelineStageFlags, VkPipelineStageFlags, VkDependencyFlags, uint32_t, const VkMemoryBarrier *, uint32_t, const VkBufferMemoryBarrier *, uint32_t, const VkImageMemoryBarrier *);
 VKAPI_ATTR void VKAPI_CALL vk_ps4_CmdClearColorImage(VkCommandBuffer, VkImage, VkImageLayout, const VkClearColorValue *, uint32_t, const VkImageSubresourceRange *);
 VKAPI_ATTR void VKAPI_CALL vk_ps4_CmdClearDepthStencilImage(VkCommandBuffer, VkImage, VkImageLayout, const VkClearDepthStencilValue *, uint32_t, const VkImageSubresourceRange *);
@@ -151,46 +155,215 @@ VKAPI_ATTR VkResult VKAPI_CALL vk_ps4_QueuePresentKHR(VkQueue, const VkPresentIn
     VKAPI_ATTR rettype VKAPI_CALL name(void) { return retval; }
 
 /* Functions we haven't implemented yet — return VK_ERROR_FEATURE_NOT_PRESENT */
-STUB_NOT_IMPL(vk_ps4_EnumerateInstanceExtensionProperties, VkResult, VK_ERROR_FEATURE_NOT_PRESENT)
-STUB_NOT_IMPL(vk_ps4_EnumerateInstanceLayerProperties, VkResult, VK_ERROR_FEATURE_NOT_PRESENT)
-STUB_NOT_IMPL(vk_ps4_EnumerateDeviceExtensionProperties, VkResult, VK_ERROR_FEATURE_NOT_PRESENT)
-STUB_NOT_IMPL(vk_ps4_EnumerateDeviceLayerProperties, VkResult, VK_ERROR_FEATURE_NOT_PRESENT)
-STUB_NOT_IMPL(vk_ps4_GetPhysicalDeviceSparseImageFormatProperties, void, )
-STUB_NOT_IMPL(vk_ps4_GetPhysicalDeviceImageFormatProperties, VkResult, VK_ERROR_FEATURE_NOT_PRESENT)
-STUB_NOT_IMPL(vk_ps4_GetBufferMemoryRequirements2, void, )
-STUB_NOT_IMPL(vk_ps4_GetImageMemoryRequirements2, void, )
-STUB_NOT_IMPL(vk_ps4_CreateBufferView, VkResult, VK_ERROR_FEATURE_NOT_PRESENT)
-STUB_NOT_IMPL(vk_ps4_DestroyBufferView, void, )
-STUB_NOT_IMPL(vk_ps4_CreatePipelineCache, VkResult, VK_ERROR_FEATURE_NOT_PRESENT)
-STUB_NOT_IMPL(vk_ps4_DestroyPipelineCache, void, )
-STUB_NOT_IMPL(vk_ps4_GetPipelineCacheData, VkResult, VK_ERROR_FEATURE_NOT_PRESENT)
-STUB_NOT_IMPL(vk_ps4_MergePipelineCaches, VkResult, VK_ERROR_FEATURE_NOT_PRESENT)
-STUB_NOT_IMPL(vk_ps4_GetRenderAreaGranularity, void, )
-STUB_NOT_IMPL(vk_ps4_CmdSetLineWidth, void, )
-STUB_NOT_IMPL(vk_ps4_CmdSetDepthBias, void, )
-STUB_NOT_IMPL(vk_ps4_CmdSetBlendConstants, void, )
-STUB_NOT_IMPL(vk_ps4_CmdSetDepthBounds, void, )
-STUB_NOT_IMPL(vk_ps4_CmdSetStencilCompareMask, void, )
-STUB_NOT_IMPL(vk_ps4_CmdSetStencilWriteMask, void, )
-STUB_NOT_IMPL(vk_ps4_CmdSetStencilReference, void, )
-STUB_NOT_IMPL(vk_ps4_CmdExecuteCommands, void, )
-STUB_NOT_IMPL(vk_ps4_CmdNextSubpass, void, )
-STUB_NOT_IMPL(vk_ps4_CmdCopyQueryPoolResults, void, )
-STUB_NOT_IMPL(vk_ps4_CmdBeginRenderPass2, void, )
-STUB_NOT_IMPL(vk_ps4_CmdEndRenderPass2, void, )
-STUB_NOT_IMPL(vk_ps4_CmdDispatchIndirect, void, )
-STUB_NOT_IMPL(vk_ps4_CmdFillBuffer, void, )
-STUB_NOT_IMPL(vk_ps4_CmdUpdateBuffer, void, )
-STUB_NOT_IMPL(vk_ps4_CmdResolveImage, void, )
-STUB_NOT_IMPL(vk_ps4_CmdWaitEvents, void, )
-STUB_NOT_IMPL(vk_ps4_CmdResetEvent, void, )
-STUB_NOT_IMPL(vk_ps4_CmdSetEvent, void, )
-STUB_NOT_IMPL(vk_ps4_GetDeviceMemoryCommitment, void, )
-STUB_NOT_IMPL(vk_ps4_GetImageSparseMemoryRequirements, void, )
-STUB_NOT_IMPL(vk_ps4_GetImageSparseMemoryRequirements2, void, )
-STUB_NOT_IMPL(vk_ps4_GetDeviceProcAddr, PFN_vkVoidFunction, NULL)
+
+/* Sparse image format properties: no sparse support — report 0 properties. */
+VKAPI_ATTR void VKAPI_CALL
+vk_ps4_GetPhysicalDeviceSparseImageFormatProperties(VkPhysicalDevice physicalDevice, VkFormat format,
+                                                     VkImageType type, VkSampleCountFlagBits samples,
+                                                     VkImageUsageFlags usage, VkImageTiling tiling,
+                                                     uint32_t *pPropertyCount,
+                                                     VkSparseImageFormatProperties *pProperties) {
+    (void)physicalDevice; (void)format; (void)type; (void)samples;
+    (void)usage; (void)tiling; (void)pProperties;
+    if (pPropertyCount) *pPropertyCount = 0;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+vk_ps4_GetPhysicalDeviceImageFormatProperties(VkPhysicalDevice physicalDevice, VkFormat format,
+                                               VkImageType type, VkImageTiling tiling,
+                                               VkImageUsageFlags usage, VkImageCreateFlags flags,
+                                               VkImageFormatProperties *pImageFormatProperties) {
+    (void)physicalDevice; (void)flags;
+    if (!pImageFormatProperties) return VK_ERROR_FORMAT_NOT_SUPPORTED;
+    /* Report basic properties based on format.
+     * Max dimensions are conservative for PS4 (GCN). */
+    memset(pImageFormatProperties, 0, sizeof(*pImageFormatProperties));
+    pImageFormatProperties->maxExtent.width = 16384;
+    pImageFormatProperties->maxExtent.height = 16384;
+    pImageFormatProperties->maxExtent.depth = 2048;
+    pImageFormatProperties->maxMipLevels = 15;
+    pImageFormatProperties->maxArrayLayers = 2048;
+    pImageFormatProperties->sampleCounts = VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_2_BIT |
+                                           VK_SAMPLE_COUNT_4_BIT | VK_SAMPLE_COUNT_8_BIT;
+    pImageFormatProperties->maxResourceSize = 0xFFFFFFFF;
+    (void)format; (void)type; (void)tiling; (void)usage;
+    return VK_SUCCESS;
+}
+
+/* Memory requirements 2 — thin wrapper over the v1 functions. */
+VKAPI_ATTR void VKAPI_CALL
+vk_ps4_GetBufferMemoryRequirements2(VkDevice device,
+                                     const VkBufferMemoryRequirementsInfo2 *pInfo,
+                                     VkMemoryRequirements2 *pMemoryRequirements) {
+    if (!pInfo || !pMemoryRequirements) return;
+    vk_ps4_GetBufferMemoryRequirements(device, pInfo->buffer,
+        &pMemoryRequirements->memoryRequirements);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+vk_ps4_GetImageMemoryRequirements2(VkDevice device,
+                                    const VkImageMemoryRequirementsInfo2 *pInfo,
+                                    VkMemoryRequirements2 *pMemoryRequirements) {
+    if (!pInfo || !pMemoryRequirements) return;
+    vk_ps4_GetImageMemoryRequirements(device, pInfo->image,
+        &pMemoryRequirements->memoryRequirements);
+}
+
+/* Render area granularity — return {1,1} (no granularity constraint). */
+VKAPI_ATTR void VKAPI_CALL
+vk_ps4_GetRenderAreaGranularity(VkDevice device, VkRenderPass renderPass,
+                                 VkExtent2D *pGranularity) {
+    (void)device; (void)renderPass;
+    if (pGranularity) { pGranularity->width = 1; pGranularity->height = 1; }
+}
+
+/* Device memory commitment — always 0 (no sparse memory). */
+VKAPI_ATTR void VKAPI_CALL
+vk_ps4_GetDeviceMemoryCommitment(VkDevice device, VkDeviceMemory memory,
+                                  VkDeviceSize *pCommittedMemoryInBytes) {
+    (void)device; (void)memory;
+    if (pCommittedMemoryInBytes) *pCommittedMemoryInBytes = 0;
+}
+
+/* Sparse image memory requirements — no sparse support. */
+VKAPI_ATTR void VKAPI_CALL
+vk_ps4_GetImageSparseMemoryRequirements(VkPhysicalDevice physicalDevice, VkImage image,
+                                         uint32_t *pSparseMemoryRequirementCount,
+                                         VkSparseImageMemoryRequirements *pSparseMemoryRequirements) {
+    (void)physicalDevice; (void)image; (void)pSparseMemoryRequirements;
+    if (pSparseMemoryRequirementCount) *pSparseMemoryRequirementCount = 0;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+vk_ps4_GetImageSparseMemoryRequirements2(VkDevice device, const VkImageSparseMemoryRequirementsInfo2 *pInfo,
+                                          uint32_t *pSparseMemoryRequirementCount,
+                                          VkSparseImageMemoryRequirements2 *pSparseMemoryRequirements) {
+    (void)device; (void)pInfo; (void)pSparseMemoryRequirements;
+    if (pSparseMemoryRequirementCount) *pSparseMemoryRequirementCount = 0;
+}
+
+/* Queue family properties 2 — thin wrapper over v1. */
+VKAPI_ATTR void VKAPI_CALL
+vk_ps4_GetPhysicalDeviceQueueFamilyProperties2(VkPhysicalDevice physicalDevice,
+                                                uint32_t *pQueueFamilyPropertyCount,
+                                                VkQueueFamilyProperties2 *pQueueFamilyProperties) {
+    if (!pQueueFamilyProperties) {
+        vk_ps4_GetPhysicalDeviceQueueFamilyProperties(physicalDevice,
+            pQueueFamilyPropertyCount, NULL);
+    } else {
+        vk_ps4_GetPhysicalDeviceQueueFamilyProperties(physicalDevice,
+            pQueueFamilyPropertyCount, &pQueueFamilyProperties->queueFamilyProperties);
+    }
+}
+
+/* Pipeline cache — minimal implementation.
+ * The pipeline cache is an opaque object that stores compiled shader
+ * binaries. For now, we implement it as a simple header-only cache
+ * with no actual data. This is valid — the Vulkan spec allows empty
+ * pipeline caches. */
+typedef struct {
+    uint32_t reserved;  /* opaque handle — no data stored yet */
+} VkPs4PipelineCache;
+
+VKAPI_ATTR VkResult VKAPI_CALL
+vk_ps4_CreatePipelineCache(VkDevice device, const VkPipelineCacheCreateInfo *pCreateInfo,
+                            const VkAllocationCallbacks *pAllocator, VkPipelineCache *pPipelineCache) {
+    (void)device; (void)pCreateInfo;
+    if (!pPipelineCache) return VK_ERROR_INITIALIZATION_FAILED;
+    VkPs4PipelineCache *cache = (VkPs4PipelineCache *)vk_ps4_alloc(
+        pAllocator, sizeof(VkPs4PipelineCache), 8);
+    if (!cache) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    cache->reserved = 0;
+    *pPipelineCache = (VkPipelineCache)cache;
+    return VK_SUCCESS;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+vk_ps4_DestroyPipelineCache(VkDevice device, VkPipelineCache pipelineCache,
+                             const VkAllocationCallbacks *pAllocator) {
+    (void)device;
+    if (!pipelineCache) return;
+    vk_ps4_free(pAllocator, (void *)pipelineCache);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+vk_ps4_GetPipelineCacheData(VkDevice device, VkPipelineCache pipelineCache,
+                             size_t *pDataSize, void *pData) {
+    (void)device;
+    if (!pDataSize) return VK_ERROR_INITIALIZATION_FAILED;
+    if (!pipelineCache) {
+        *pDataSize = 0;
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    /* Vulkan pipeline cache header (VK_PIPELINE_CACHE_HEADER_VERSION_ONE):
+     *   offset  0: uint32_t headerSize  (= 32)
+     *   offset  4: uint32_t headerVersion (= 1)
+     *   offset  8: uint32_t vendorID    (= 0x1002 AMD)
+     *   offset 12: uint32_t deviceID    (= 0x9920 Liverpool)
+     *   offset 16: uint8_t  pipelineCacheUUID[16] (all zeros for now)
+     * Total: 32 bytes (16 + VK_UUID_SIZE) */
+    const size_t header_size = 16 + VK_UUID_SIZE;  /* 32 */
+    if (!pData) {
+        *pDataSize = header_size;
+        return VK_SUCCESS;
+    }
+    if (*pDataSize < header_size) {
+        *pDataSize = header_size;
+        return VK_INCOMPLETE;
+    }
+    /* Write the Vulkan pipeline cache header */
+    uint32_t *out = (uint32_t *)pData;
+    out[0] = (uint32_t)header_size;                /* headerSize */
+    out[1] = VK_PIPELINE_CACHE_HEADER_VERSION_ONE; /* headerVersion */
+    out[2] = 0x1002;                               /* vendorID (AMD) */
+    out[3] = 0x9920;                               /* deviceID (PS4 Liverpool) */
+    /* pipelineCacheUUID: 16 bytes of zeros */
+    memset(&out[4], 0, VK_UUID_SIZE);
+    *pDataSize = header_size;
+    return VK_SUCCESS;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+vk_ps4_MergePipelineCaches(VkDevice device, VkPipelineCache dstCache,
+                            uint32_t srcCacheCount, const VkPipelineCache *pSrcCaches) {
+    (void)device; (void)dstCache; (void)srcCacheCount; (void)pSrcCaches;
+    /* No-op: our cache stores nothing, so merging is trivially successful. */
+    return VK_SUCCESS;
+}
+
+/* vkCmdBeginRenderPass2 / vkCmdNextSubpass2 / vkCmdEndRenderPass2 are the
+ * Vulkan 1.2 variants of the render pass commands.  They take the same
+ * VkRenderPassBeginInfo as v1, plus VkSubpassBeginInfo/VkSubpassEndInfo
+ * which carry the `contents` field.  We delegate to the v1 implementations. */
+VKAPI_ATTR void VKAPI_CALL
+vk_ps4_CmdBeginRenderPass2(VkCommandBuffer commandBuffer,
+                            const VkRenderPassBeginInfo *pRenderPassBegin,
+                            const VkSubpassBeginInfo *pSubpassBeginInfo) {
+    VkSubpassContents contents = pSubpassBeginInfo
+        ? pSubpassBeginInfo->contents
+        : VK_SUBPASS_CONTENTS_INLINE;
+    vk_ps4_CmdBeginRenderPass(commandBuffer, pRenderPassBegin, contents);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+vk_ps4_CmdNextSubpass2(VkCommandBuffer commandBuffer,
+                        const VkSubpassBeginInfo *pSubpassBeginInfo,
+                        const VkSubpassEndInfo *pSubpassEndInfo) {
+    VkSubpassContents contents = pSubpassBeginInfo
+        ? pSubpassBeginInfo->contents
+        : VK_SUBPASS_CONTENTS_INLINE;
+    (void)pSubpassEndInfo;
+    vk_ps4_CmdNextSubpass(commandBuffer, contents);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+vk_ps4_CmdEndRenderPass2(VkCommandBuffer commandBuffer,
+                          const VkSubpassEndInfo *pSubpassEndInfo) {
+    (void)pSubpassEndInfo;
+    vk_ps4_CmdEndRenderPass(commandBuffer);
+}
+
 STUB_NOT_IMPL(vk_ps4_QueueBindSparse, VkResult, VK_ERROR_FEATURE_NOT_PRESENT)
-STUB_NOT_IMPL(vk_ps4_GetPhysicalDeviceQueueFamilyProperties2, void, )
 
 /* === Name → function lookup table === */
 typedef struct {
@@ -217,6 +390,19 @@ static const VkPs4NameEntry g_instance_funcs[] = {
     ENTRY(vkGetPhysicalDeviceSparseImageFormatProperties),
     ENTRY(vkGetPhysicalDeviceImageFormatProperties),
     ENTRY(vkCreateDevice),
+    /* Vulkan 1.1 */
+    ENTRY(vkEnumerateInstanceVersion),
+    ENTRY(vkEnumeratePhysicalDeviceGroups),
+    ENTRY(vkGetPhysicalDeviceProperties2),
+    ENTRY(vkGetPhysicalDeviceFeatures2),
+    ENTRY(vkGetPhysicalDeviceFormatProperties2),
+    ENTRY(vkGetPhysicalDeviceImageFormatProperties2),
+    ENTRY(vkGetPhysicalDeviceExternalBufferProperties),
+    ENTRY(vkGetPhysicalDeviceExternalFenceProperties),
+    ENTRY(vkGetPhysicalDeviceExternalSemaphoreProperties),
+    ENTRY(vkGetPhysicalDeviceQueueFamilyProperties2),
+    ENTRY(vkGetPhysicalDeviceMemoryProperties2),
+    ENTRY(vkGetPhysicalDeviceSparseImageFormatProperties2),
 };
 
 static const VkPs4NameEntry g_device_funcs[] = {
@@ -303,6 +489,20 @@ static const VkPs4NameEntry g_device_funcs[] = {
     ENTRY(vkGetDeviceMemoryCommitment),
     ENTRY(vkGetImageSparseMemoryRequirements),
     ENTRY(vkQueueBindSparse),
+    /* Vulkan 1.1 */
+    ENTRY(vkGetDeviceQueue2),
+    ENTRY(vkBindBufferMemory2),
+    ENTRY(vkBindImageMemory2),
+    ENTRY(vkGetDeviceGroupPeerMemoryFeatures),
+    ENTRY(vkGetDescriptorSetLayoutSupport),
+    ENTRY(vkCreateDescriptorUpdateTemplate),
+    ENTRY(vkDestroyDescriptorUpdateTemplate),
+    ENTRY(vkUpdateDescriptorSetWithTemplate),
+    ENTRY(vkGetBufferMemoryRequirements2),
+    ENTRY(vkGetImageMemoryRequirements2),
+    ENTRY(vkGetImageSparseMemoryRequirements2),
+    ENTRY(vkCreateSamplerYcbcrConversion),
+    ENTRY(vkDestroySamplerYcbcrConversion),
 };
 
 static const VkPs4NameEntry g_cmd_funcs[] = {
@@ -342,6 +542,9 @@ static const VkPs4NameEntry g_cmd_funcs[] = {
     ENTRY(vkCmdSetStencilReference),
     ENTRY(vkCmdExecuteCommands),
     ENTRY(vkCmdNextSubpass),
+    ENTRY(vkCmdBeginRenderPass2),
+    ENTRY(vkCmdNextSubpass2),
+    ENTRY(vkCmdEndRenderPass2),
     ENTRY(vkCmdCopyQueryPoolResults),
     ENTRY(vkCmdDispatchIndirect),
     ENTRY(vkCmdFillBuffer),
@@ -350,6 +553,13 @@ static const VkPs4NameEntry g_cmd_funcs[] = {
     ENTRY(vkCmdWaitEvents),
     ENTRY(vkCmdResetEvent),
     ENTRY(vkCmdSetEvent),
+    /* Vulkan 1.1 */
+    ENTRY(vkCmdSetDeviceMask),
+    ENTRY(vkCmdDispatchBase),
+    /* VK_KHR_timeline_semaphore */
+    ENTRY(vkGetSemaphoreCounterValueKHR),
+    ENTRY(vkSignalSemaphoreKHR),
+    ENTRY(vkWaitSemaphoresKHR),
 };
 
 /* === vkGetInstanceProcAddr === */

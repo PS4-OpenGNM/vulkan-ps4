@@ -43,7 +43,7 @@ extern "C" {
 #endif
 
 /* === Version === */
-#define VK_PS4_API_VERSION VK_MAKE_VERSION(1, 0, 0)
+#define VK_PS4_API_VERSION VK_MAKE_VERSION(1, 1, 0)
 #define VK_PS4_DRIVER_VERSION VK_MAKE_VERSION(0, 1, 0)
 
 /* === Memory types === */
@@ -139,6 +139,28 @@ struct VkPs4Device {
     uint32_t queue_count;
     /* GNM state */
     bool gnm_initialized;
+    /* Device-wide GNM init command buffer backing store.
+     * Allocated from Garlic direct memory so the GPU can execute the
+     * sceGnmDrawInitDefaultHardwareState preamble submitted at CreateDevice.
+     * Held in the device so DestroyDevice can release it after the GPU is
+     * quiesced. */
+    GnmDirectMemory gnm_init_mem;
+    uint32_t *gnm_init_cmd;
+    uint32_t gnm_init_cmd_dwords;
+    /* Epilogue command buffer used by QueueSubmit to emit EOP event writes
+         * for fence/semaphore signaling.  Reused across submits — only one
+         * submit is in flight at a time because QueueSubmit is serialized. */
+    GnmDirectMemory gnm_epilogue_mem;
+    uint32_t *gnm_epilogue_cmd;
+    uint32_t gnm_epilogue_cmd_dwords;
+    /* Embedded clear pixel shader for tiled RT clears.
+     * The clear PS outputs a UBO vec4 to MRT0, enabling draw-based
+     * clears on tiled surfaces where FillMemory doesn't work.
+     * Allocated from regular memory (GPU-accessible on PS4) at
+     * device init time. */
+    void *clear_ps_binary;
+    GnmPsStageRegisters clear_ps_regs;
+    bool clear_ps_ready;
 };
 
 /* === Queue === */
@@ -184,6 +206,10 @@ struct VkPs4CommandBuffer {
         uint32_t current_subpass;  /* index into pass->subpasses */
         VkClearValue clear_values[16];  /* deep-copied from CmdBeginRenderPass */
         uint32_t clear_value_count;
+        /* For imageless framebuffers: attachment views from
+         * VkRenderPassAttachmentBeginInfo at beginRenderPass time. */
+        VkPs4ImageView *imageless_attachments[16];
+        uint32_t imageless_attachment_count;
     } current_render_pass;
     /* Current pipeline */
     VkPs4Pipeline *current_pipeline;
@@ -255,6 +281,12 @@ struct VkPs4Image {
     GnmDepthRenderTarget gnm_drt;  /* if used as depth target */
     bool is_render_target;
     bool is_depth_target;
+    /* Swapchain image tracking: if this image is a swapchain buffer,
+     * these fields identify the video out handle and buffer index so
+     * that CmdBeginRenderPass can emit WaitUntilSafeForRendering. */
+    bool is_swapchain_image;
+    int32_t video_out_handle;
+    uint32_t swapchain_buffer_index;
     VkPs4DeviceMemory *memory;
     VkDeviceSize memory_offset;
     VkImageLayout layout;
@@ -278,6 +310,17 @@ struct VkPs4RenderPass {
     VkAttachmentDescription *attachments;
     uint32_t subpass_count;
     VkSubpassDescription *subpasses;
+    /* Deep-copied subpass internal arrays — one slot per subpass.
+     * Kept alive for the render pass's lifetime because CmdBeginRenderPass
+     * and CmdNextSubpass dereference them after the caller's pCreateInfo
+     * has been freed. */
+    VkAttachmentReference **subpass_input_attachments;   /* [subpass_count], NULL slots ok */
+    VkAttachmentReference **subpass_color_attachments;   /* [subpass_count] */
+    VkAttachmentReference **subpass_resolve_attachments; /* [subpass_count], NULL slots ok */
+    VkAttachmentReference **subpass_depth_stencil;       /* [subpass_count], NULL slots ok */
+    uint32_t **subpass_preserve_attachments;             /* [subpass_count], NULL slots ok */
+    uint32_t subpass_dependency_count;
+    VkSubpassDependency *dependencies;
 };
 
 /* === Framebuffer === */
@@ -287,10 +330,11 @@ struct VkPs4Framebuffer {
     VkPs4RenderPass *render_pass;
     VkFramebufferCreateInfo create_info;
     uint32_t attachment_count;
-    VkPs4ImageView **attachments;
+    VkPs4ImageView **attachments;   /* NULL for imageless framebuffers */
     uint32_t width;
     uint32_t height;
     uint32_t layers;
+    bool imageless;                 /* VK_FRAMEBUFFER_CREATE_IMAGELESS_BIT_KHR */
 };
 
 /* === Shader module === */
@@ -311,6 +355,11 @@ struct VkPs4DescriptorSetLayout {
     VkDescriptorSetLayoutCreateInfo create_info;
     VkDescriptorSetLayoutBinding *bindings;
     uint32_t binding_count;
+    /* VK_EXT_descriptor_indexing: per-binding flags */
+    VkDescriptorBindingFlags *binding_flags;
+    /* Variable descriptor count: the last binding's max count can vary
+     * at descriptor set allocation time. */
+    uint32_t variable_descriptor_binding;  /* binding index, or UINT32_MAX */
 };
 
 struct VkPs4PipelineLayout {
@@ -339,6 +388,15 @@ struct VkPs4Pipeline {
     VkPs4ShaderModule *tcs_module;
     VkPs4ShaderModule *tes_module;
     VkPs4ShaderModule *cs_module;
+    /* Compiled GCN shader binaries — kept alive for the pipeline's lifetime
+     * because the stage registers contain GPU addresses that point into
+     * these buffers.  Freed in DestroyPipeline. */
+    void *vs_binary;
+    void *ps_binary;
+    void *gs_binary;
+    void *tcs_binary;
+    void *tes_binary;
+    void *cs_binary;
     /* GNM shader stage registers */
     GnmVsStageRegisters vs_regs;
     GnmPsStageRegisters ps_regs;
@@ -391,6 +449,33 @@ struct VkPs4Pipeline {
     /* Vertex input semantics extracted from VS shader binary */
     GnmVertexInputSemantic vs_input_semantics[VK_PS4_MAX_INPUT_USAGE_SLOTS];
     uint32_t vs_input_semantic_count;
+    /* Push constant inline register mapping — extracted from
+     * IMM_ALUFLOATCONST input usage slots emitted by psbc.
+     * Each entry maps a push constant dword index to a user-data
+     * register for that shader stage. */
+#define VK_PS4_MAX_PUSH_CONST_DWORDS 32  /* 128 bytes / 4 */
+    struct {
+        uint8_t dword_index;     /* push constant dword offset */
+        uint8_t user_data_reg;   /* GNM user-data register */
+    } vs_push_const_slots[VK_PS4_MAX_PUSH_CONST_DWORDS];
+    uint32_t vs_push_const_slot_count;
+    struct {
+        uint8_t dword_index;
+        uint8_t user_data_reg;
+    } ps_push_const_slots[VK_PS4_MAX_PUSH_CONST_DWORDS];
+    uint32_t ps_push_const_slot_count;
+    struct {
+        uint8_t dword_index;
+        uint8_t user_data_reg;
+    } cs_push_const_slots[VK_PS4_MAX_PUSH_CONST_DWORDS];
+    uint32_t cs_push_const_slot_count;
+    /* VS draw offset registers — extracted from IMM_ALUFLOATCONST slots
+     * with special apislot values emitted by psbc.
+     * 0xFE = base_vertex (vertexOffset), 0xFF = start_instance (firstInstance). */
+    uint8_t vs_base_vertex_reg;      /* user-data reg for vertexOffset */
+    uint8_t vs_start_instance_reg;   /* user-data reg for firstInstance */
+    bool has_base_vertex_reg;
+    bool has_start_instance_reg;
     /* Pre-computed depth/stencil GNM state (converted from VkPipelineDepthStencilStateCreateInfo) */
     GnmDepthStencilControl depth_stencil_control;
     bool has_depth_stencil_state;  /* true if pDepthStencilState was non-NULL */
@@ -425,19 +510,43 @@ struct VkPs4DescriptorSet {
     VkPs4DescriptorSetLayout *layout;
     VkPs4DescriptorBinding bindings[VK_PS4_MAX_DESCRIPTOR_BINDINGS];
     uint32_t binding_count;
+    /* VK_EXT_descriptor_indexing: variable descriptor count for the
+     * last binding (0 if layout doesn't use variable count). */
+    uint32_t variable_descriptor_count;
 };
 
 /* === Sync === */
 struct VkPs4Fence {
     VkPs4ObjectType type;
     VkPs4Device *device;
+    /* CPU-side fallback flag used when the device has no GNM epilogue
+         * buffer (host tests) or before the first signal. */
     bool signaled;
+    /* GPU signal label — allocated from Garlic direct memory.  The GPU
+         * writes signal_value here via an EOP event write at the end of the
+         * submit that signals this fence.  WaitForFences polls this label. */
+    GnmDirectMemory label_mem;
+    volatile uint32_t *label;
+    uint32_t signal_value;
 };
 
 struct VkPs4Semaphore {
     VkPs4ObjectType type;
     VkPs4Device *device;
     bool signaled;
+    /* GPU signal label — same EOP mechanism as fences.  Wait semaphores
+         * block the next submit's first command buffer with WaitMem until
+         * the label matches signal_value. */
+    GnmDirectMemory label_mem;
+    volatile uint32_t *label;
+    uint32_t signal_value;
+    /* VK_KHR_timeline_semaphore: timeline semaphore support.
+     * Timeline semaphores maintain a monotonically increasing counter
+     * instead of a binary signaled/unsignaled state.  The counter is
+     * software-managed (CPU-side) since the GPU EOP label only supports
+     * 32-bit values and we need 64-bit timeline values. */
+    bool is_timeline;
+    uint64_t timeline_value;      /* current signaled value */
 };
 
 struct VkPs4Event {
@@ -470,6 +579,19 @@ struct VkPs4Swapchain {
     VkPs4Image *images;
     uint32_t image_count;
     uint32_t current_image;
+    /* Per-image in-flight tracking for AcquireNextImageKHR.
+     *
+     * image_in_flight[] is the authoritative tracking — set to true
+     * when an image is acquired and cleared when QueuePresentKHR
+     * completes the flip.  This is independent of whether the caller
+     * passed a fence, so semaphore-only sync patterns work correctly.
+     *
+     * image_fences[] stores the caller's fence (if provided) as an
+     * optimization: when all images are in-flight, we wait on the
+     * fence rather than busy-spinning.  May be NULL if the caller
+     * used semaphore-only sync. */
+    bool image_in_flight[GNM_VIDEO_OUT_MAX_BUFFERS];
+    VkFence image_fences[GNM_VIDEO_OUT_MAX_BUFFERS];
 };
 
 /* === Utility macros === */
@@ -535,14 +657,15 @@ VKAPI_ATTR VkResult VKAPI_CALL vk_ps4_InvalidateMappedMemoryRanges(VkDevice, uin
 VKAPI_ATTR VkResult VKAPI_CALL vk_ps4_CreateBuffer(VkDevice, const VkBufferCreateInfo *, const VkAllocationCallbacks *, VkBuffer *);
 VKAPI_ATTR void VKAPI_CALL vk_ps4_DestroyBuffer(VkDevice, VkBuffer, const VkAllocationCallbacks *);
 VKAPI_ATTR void VKAPI_CALL vk_ps4_GetBufferMemoryRequirements(VkDevice, VkBuffer, VkMemoryRequirements *);
-VKAPI_ATTR void VKAPI_CALL vk_ps4_GetBufferMemoryRequirements2(VkDevice, VkBuffer, VkMemoryRequirements2 *);
+VKAPI_ATTR void VKAPI_CALL vk_ps4_GetBufferMemoryRequirements2(VkDevice, const VkBufferMemoryRequirementsInfo2 *, VkMemoryRequirements2 *);
 VKAPI_ATTR VkResult VKAPI_CALL vk_ps4_BindBufferMemory(VkDevice, VkBuffer, VkDeviceMemory, VkDeviceSize);
 
 /* Image */
 VKAPI_ATTR VkResult VKAPI_CALL vk_ps4_CreateImage(VkDevice, const VkImageCreateInfo *, const VkAllocationCallbacks *, VkImage *);
 VKAPI_ATTR void VKAPI_CALL vk_ps4_DestroyImage(VkDevice, VkImage, const VkAllocationCallbacks *);
 VKAPI_ATTR void VKAPI_CALL vk_ps4_GetImageMemoryRequirements(VkDevice, VkImage, VkMemoryRequirements *);
-VKAPI_ATTR void VKAPI_CALL vk_ps4_GetImageMemoryRequirements2(VkDevice, VkImage, VkMemoryRequirements2 *);
+VKAPI_ATTR void VKAPI_CALL vk_ps4_GetImageMemoryRequirements2(VkDevice, const VkImageMemoryRequirementsInfo2 *, VkMemoryRequirements2 *);
+VKAPI_ATTR void VKAPI_CALL vk_ps4_GetImageSparseMemoryRequirements2(VkDevice, const VkImageSparseMemoryRequirementsInfo2 *, uint32_t *, VkSparseImageMemoryRequirements2 *);
 VKAPI_ATTR VkResult VKAPI_CALL vk_ps4_BindImageMemory(VkDevice, VkImage, VkDeviceMemory, VkDeviceSize);
 VKAPI_ATTR VkResult VKAPI_CALL vk_ps4_CreateImageView(VkDevice, const VkImageViewCreateInfo *, const VkAllocationCallbacks *, VkImageView *);
 VKAPI_ATTR void VKAPI_CALL vk_ps4_DestroyImageView(VkDevice, VkImageView, const VkAllocationCallbacks *);
@@ -623,6 +746,9 @@ VKAPI_ATTR void VKAPI_CALL vk_ps4_CmdCopyImageToBuffer(VkCommandBuffer, VkImage,
 VKAPI_ATTR void VKAPI_CALL vk_ps4_CmdBeginRenderPass(VkCommandBuffer, const VkRenderPassBeginInfo *, VkSubpassContents);
 VKAPI_ATTR void VKAPI_CALL vk_ps4_CmdNextSubpass(VkCommandBuffer, VkSubpassContents);
 VKAPI_ATTR void VKAPI_CALL vk_ps4_CmdEndRenderPass(VkCommandBuffer);
+VKAPI_ATTR void VKAPI_CALL vk_ps4_CmdBeginRenderPass2(VkCommandBuffer, const VkRenderPassBeginInfo *, const VkSubpassBeginInfo *);
+VKAPI_ATTR void VKAPI_CALL vk_ps4_CmdNextSubpass2(VkCommandBuffer, const VkSubpassBeginInfo *, const VkSubpassEndInfo *);
+VKAPI_ATTR void VKAPI_CALL vk_ps4_CmdEndRenderPass2(VkCommandBuffer, const VkSubpassEndInfo *);
 VKAPI_ATTR void VKAPI_CALL vk_ps4_CmdPipelineBarrier(VkCommandBuffer, VkPipelineStageFlags, VkPipelineStageFlags, VkDependencyFlags, uint32_t, const VkMemoryBarrier *, uint32_t, const VkBufferMemoryBarrier *, uint32_t, const VkImageMemoryBarrier *);
 VKAPI_ATTR void VKAPI_CALL vk_ps4_CmdSetEvent(VkCommandBuffer, VkEvent, VkPipelineStageFlags);
 VKAPI_ATTR void VKAPI_CALL vk_ps4_CmdResetEvent(VkCommandBuffer, VkEvent, VkPipelineStageFlags);
@@ -651,6 +777,11 @@ VKAPI_ATTR void VKAPI_CALL vk_ps4_DestroyEvent(VkDevice, VkEvent, const VkAlloca
 VKAPI_ATTR VkResult VKAPI_CALL vk_ps4_GetEventStatus(VkDevice, VkEvent);
 VKAPI_ATTR VkResult VKAPI_CALL vk_ps4_SetEvent(VkDevice, VkEvent);
 VKAPI_ATTR VkResult VKAPI_CALL vk_ps4_ResetEvent(VkDevice, VkEvent);
+
+/* VK_KHR_timeline_semaphore */
+VKAPI_ATTR VkResult VKAPI_CALL vk_ps4_GetSemaphoreCounterValueKHR(VkDevice, VkSemaphore, uint64_t *);
+VKAPI_ATTR VkResult VKAPI_CALL vk_ps4_SignalSemaphoreKHR(VkDevice, const VkSemaphoreSignalInfoKHR *);
+VKAPI_ATTR VkResult VKAPI_CALL vk_ps4_WaitSemaphoresKHR(VkDevice, const VkSemaphoreWaitInfoKHR *, uint64_t);
 
 /* Query */
 VKAPI_ATTR VkResult VKAPI_CALL vk_ps4_CreateQueryPool(VkDevice, const VkQueryPoolCreateInfo *, const VkAllocationCallbacks *, VkQueryPool *);
@@ -682,6 +813,31 @@ VKAPI_ATTR VkResult VKAPI_CALL vk_ps4_ResetDescriptorPool(VkDevice, VkDescriptor
 
 /* Image subresource layout */
 VKAPI_ATTR void VKAPI_CALL vk_ps4_GetImageSubresourceLayout(VkDevice, VkImage, const VkImageSubresource *, VkSubresourceLayout *);
+
+/* === Vulkan 1.1 core functions === */
+VKAPI_ATTR VkResult VKAPI_CALL vk_ps4_EnumerateInstanceVersion(uint32_t *);
+VKAPI_ATTR VkResult VKAPI_CALL vk_ps4_EnumeratePhysicalDeviceGroups(VkInstance, uint32_t *, VkPhysicalDeviceGroupProperties *);
+VKAPI_ATTR void VKAPI_CALL vk_ps4_GetPhysicalDeviceProperties2(VkPhysicalDevice, VkPhysicalDeviceProperties2 *);
+VKAPI_ATTR void VKAPI_CALL vk_ps4_GetPhysicalDeviceFeatures2(VkPhysicalDevice, VkPhysicalDeviceFeatures2 *);
+VKAPI_ATTR void VKAPI_CALL vk_ps4_GetPhysicalDeviceFormatProperties2(VkPhysicalDevice, VkFormat, VkFormatProperties2 *);
+VKAPI_ATTR VkResult VKAPI_CALL vk_ps4_GetPhysicalDeviceImageFormatProperties2(VkPhysicalDevice, const VkPhysicalDeviceImageFormatInfo2 *, VkImageFormatProperties2 *);
+VKAPI_ATTR void VKAPI_CALL vk_ps4_GetPhysicalDeviceExternalBufferProperties(VkPhysicalDevice, const VkPhysicalDeviceExternalBufferInfo *, VkExternalBufferProperties *);
+VKAPI_ATTR void VKAPI_CALL vk_ps4_GetPhysicalDeviceExternalFenceProperties(VkPhysicalDevice, const VkPhysicalDeviceExternalFenceInfo *, VkExternalFenceProperties *);
+VKAPI_ATTR void VKAPI_CALL vk_ps4_GetPhysicalDeviceExternalSemaphoreProperties(VkPhysicalDevice, const VkPhysicalDeviceExternalSemaphoreInfo *, VkExternalSemaphoreProperties *);
+VKAPI_ATTR void VKAPI_CALL vk_ps4_GetPhysicalDeviceMemoryProperties2(VkPhysicalDevice, VkPhysicalDeviceMemoryProperties2 *);
+VKAPI_ATTR void VKAPI_CALL vk_ps4_GetPhysicalDeviceSparseImageFormatProperties2(VkPhysicalDevice, const VkPhysicalDeviceSparseImageFormatInfo2 *, uint32_t *, VkSparseImageFormatProperties2 *);
+VKAPI_ATTR VkResult VKAPI_CALL vk_ps4_CreateSamplerYcbcrConversion(VkDevice, const VkSamplerYcbcrConversionCreateInfo *, const VkAllocationCallbacks *, VkSamplerYcbcrConversion *);
+VKAPI_ATTR void VKAPI_CALL vk_ps4_DestroySamplerYcbcrConversion(VkDevice, VkSamplerYcbcrConversion, const VkAllocationCallbacks *);
+VKAPI_ATTR void VKAPI_CALL vk_ps4_GetDeviceQueue2(VkDevice, const VkDeviceQueueInfo2 *, VkQueue *);
+VKAPI_ATTR VkResult VKAPI_CALL vk_ps4_BindBufferMemory2(VkDevice, uint32_t, const VkBindBufferMemoryInfo *);
+VKAPI_ATTR VkResult VKAPI_CALL vk_ps4_BindImageMemory2(VkDevice, uint32_t, const VkBindImageMemoryInfo *);
+VKAPI_ATTR void VKAPI_CALL vk_ps4_GetDeviceGroupPeerMemoryFeatures(VkDevice, uint32_t, uint32_t, uint32_t, VkPeerMemoryFeatureFlags *);
+VKAPI_ATTR void VKAPI_CALL vk_ps4_GetDescriptorSetLayoutSupport(VkDevice, const VkDescriptorSetLayoutCreateInfo *, VkDescriptorSetLayoutSupport *);
+VKAPI_ATTR VkResult VKAPI_CALL vk_ps4_CreateDescriptorUpdateTemplate(VkDevice, const VkDescriptorUpdateTemplateCreateInfo *, const VkAllocationCallbacks *, VkDescriptorUpdateTemplate *);
+VKAPI_ATTR void VKAPI_CALL vk_ps4_DestroyDescriptorUpdateTemplate(VkDevice, VkDescriptorUpdateTemplate, const VkAllocationCallbacks *);
+VKAPI_ATTR void VKAPI_CALL vk_ps4_UpdateDescriptorSetWithTemplate(VkDevice, VkDescriptorSet, VkDescriptorUpdateTemplate, const void *);
+VKAPI_ATTR void VKAPI_CALL vk_ps4_CmdSetDeviceMask(VkCommandBuffer, uint32_t);
+VKAPI_ATTR void VKAPI_CALL vk_ps4_CmdDispatchBase(VkCommandBuffer, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t);
 
 #ifdef __cplusplus
 }

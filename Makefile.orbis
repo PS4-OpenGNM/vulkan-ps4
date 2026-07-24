@@ -91,7 +91,8 @@ VK_PS4_SRCS := \
 	src/vk_ps4_queue.c \
 	src/vk_ps4_sync.c \
 	src/vk_ps4_query.c \
-	src/vk_ps4_stubs.c
+	src/vk_ps4_stubs.c \
+	src/vk_ps4_vulkan11.c
 
 VK_PS4_OBJS := $(VK_PS4_SRCS:.c=.orbis.o)
 
@@ -99,6 +100,54 @@ VK_PS4_OBJS := $(VK_PS4_SRCS:.c=.orbis.o)
 LIB_NAME := vulkan_ps4
 LIB_SHARED := lib$(LIB_NAME).so
 LIB_STATIC := lib$(LIB_NAME).a
+
+# === Test program (PS4 .self) ===
+TEST_SRC := tests/test_triangle_ps4.c
+TEST_OBJ := $(TEST_SRC:.c=.orbis.o)
+# Mesa utility stubs (BLAKE3 SIMD, DXT format, logging) — linked into the test
+# to resolve symbols that libpsbc.orbis.a references but doesn't include.
+MESA_STUBS_SRC := src/mesa_stubs.c
+MESA_STUBS_OBJ := $(MESA_STUBS_SRC:.c=.orbis.o)
+TEST_ELF := test_triangle_ps4.elf
+TEST_OELF := test_triangle_ps4.oelf
+TEST_SELF := test_triangle_ps4.self
+EBOOT := eboot.bin
+
+# === Packaging tools (platform-specific) ===
+UNAME_S := $(shell uname -s)
+ifeq ($(UNAME_S),Darwin)
+    MKFSELF ?= $(OO_PS4_TOOLCHAIN)/bin/macos/create-fself-macos
+    MKGP4   ?= $(OO_PS4_TOOLCHAIN)/bin/macos/create-gp4
+    PKGTOOL ?= $(OO_PS4_TOOLCHAIN)/bin/macos/PkgTool.Core
+else
+    MKFSELF ?= $(OO_PS4_TOOLCHAIN)/bin/linux/create-fself
+    MKGP4   ?= $(OO_PS4_TOOLCHAIN)/bin/linux/create-gp4
+    PKGTOOL ?= $(OO_PS4_TOOLCHAIN)/bin/linux/PkgTool.Core
+endif
+
+# Paid for non-secure self (homebrew)
+PAID := 0x3800000000000011
+
+# Package metadata
+PKG_TITLE := vulkan-ps4 Triangle Test
+PKG_VERSION := 1.00
+PKG_TITLE_ID := VPS400000
+PKG_CONTENT_ID := IV0000-VPS400000_00-VKTRIANGLETEST00
+
+# App link flags — link the test against libvulkan_ps4.a (static) + PS4 system libs
+# PS4 homebrew statically links user libraries; only system libs are dynamic.
+APP_LDFLAGS := -m elf_x86_64 --script $(OO_PS4_TOOLCHAIN)/link.x --eh-frame-hdr \
+               -L$(OO_PS4_TOOLCHAIN)/lib -L$(CURDIR) $(LIBDIRS) \
+               -pie -z max-page-size=0x4000 --gc-sections \
+               --dynamic-linker /libexec/ld-elf.so.1
+
+# Static link: libvulkan_ps4.a + libopengnm.a + libpsbc.orbis.a, then dynamic system libs
+# --whole-archive for vulkan_ps4 + opengnm (cross-references between archives).
+# libpsbc uses normal archive linking (selective pull) to avoid pulling in
+# 477 Mesa objects with unresolved SIMD/format dependencies.
+# Use deferred assignment (=) so OPENGNM_LIB (defined below) is resolved at use time.
+APP_LIBS = --whole-archive $(LIB_STATIC) $(OPENGNM_LIB) --no-whole-archive \
+           $(PSBC_LIB) $(PS4_LIBS)
 
 # === Link flags ===
 # Link against opengnm (orbis build), libpsbc, and OpenOrbis firmware stubs
@@ -119,9 +168,13 @@ LDFLAGS_SHARED := -shared -m elf_x86_64 \
                   -L$(OO_PS4_TOOLCHAIN)/lib $(LIBDIRS) \
                   --gc-sections -z max-page-size=0x4000
 
-.PHONY: all clean static shared
+.PHONY: all clean static shared self pkg
 
 all: $(LIB_SHARED) $(LIB_STATIC)
+
+# Build everything: library + test .self + .pkg
+self: $(TEST_SELF)
+pkg: $(PKG_CONTENT_ID).pkg
 
 # === Build rules ===
 %.orbis.o: %.c
@@ -139,9 +192,88 @@ $(LIB_SHARED): $(VK_PS4_OBJS)
 	@$(LD) $(LDFLAGS_SHARED) -o $@ $(VK_PS4_OBJS) \
 	    $(DEP_LIBS) $(PS4_LIBS)
 
+# === Test program (PS4 .self) ===
+# Compile the test source (uses the same orbis pattern rule)
+$(TEST_OBJ): $(TEST_SRC)
+	@echo "  CC $<"
+	@$(CC) $(CFLAGS) -c $< -o $@
+
+# Link the test ELF against libvulkan_ps4.a (static) + opengnm + libpsbc + PS4 libs
+$(TEST_ELF): $(TEST_OBJ) $(MESA_STUBS_OBJ) $(LIB_STATIC)
+	@echo "  LD $@"
+	@$(LD) $(APP_LDFLAGS) -o $@ \
+	    $(OO_PS4_TOOLCHAIN)/lib/crt1.o \
+	    $(TEST_OBJ) $(MESA_STUBS_OBJ) $(APP_LIBS) \
+	    $(OO_PS4_TOOLCHAIN)/lib/crtn.o
+
+# Create the OELF (orbis ELF) from the plain ELF
+$(TEST_OELF): $(TEST_ELF)
+	@echo "  OELF $@"
+	@$(MKFSELF) -in=$(TEST_ELF) -out=$(TEST_OELF) -eboot=$(EBOOT) --paid $(PAID)
+
+# The .self is the eboot.bin renamed (create-fself produces eboot.bin)
+$(TEST_SELF): $(TEST_OELF)
+	@echo "  SELF $@"
+	@cp $(EBOOT) $(TEST_SELF)
+
+# === PKG packaging ===
+# Reference sample for required PKG files (right.sprx, libc.prx, etc.)
+SAMPLE_DIR ?= $(OO_PS4_TOOLCHAIN)/samples/hello_world
+
+sce_sys:
+	@mkdir -p sce_sys/about
+
+sce_module:
+	@mkdir -p $@
+
+sce_sys/about/right.sprx: | sce_sys
+	@cp $(SAMPLE_DIR)/sce_sys/about/right.sprx $@
+
+sce_sys/icon0.png: | sce_sys
+	@cp $(SAMPLE_DIR)/sce_sys/icon0.png $@
+
+sce_module/libc.prx: | sce_module
+	@cp $(SAMPLE_DIR)/sce_module/libc.prx $@
+
+sce_module/libSceFios2.prx: | sce_module
+	@cp $(SAMPLE_DIR)/sce_module/libSceFios2.prx $@
+
+sce_sys/param.sfo: | sce_sys
+	@echo "  SFO $@"
+	@$(PKGTOOL) sfo_new $@
+	@$(PKGTOOL) sfo_setentry $@ APP_TYPE --type Integer --maxsize 4 --value 1
+	@$(PKGTOOL) sfo_setentry $@ APP_VER --type Utf8 --maxsize 8 --value '$(PKG_VERSION)'
+	@$(PKGTOOL) sfo_setentry $@ ATTRIBUTE --type Integer --maxsize 4 --value 0
+	@$(PKGTOOL) sfo_setentry $@ CATEGORY --type Utf8 --maxsize 4 --value 'gd'
+	@$(PKGTOOL) sfo_setentry $@ CONTENT_ID --type Utf8 --maxsize 48 --value '$(PKG_CONTENT_ID)'
+	@$(PKGTOOL) sfo_setentry $@ DOWNLOAD_DATA_SIZE --type Integer --maxsize 4 --value 0
+	@$(PKGTOOL) sfo_setentry $@ SYSTEM_VER --type Integer --maxsize 4 --value 0
+	@$(PKGTOOL) sfo_setentry $@ TITLE --type Utf8 --maxsize 128 --value '$(PKG_TITLE)'
+	@$(PKGTOOL) sfo_setentry $@ TITLE_ID --type Utf8 --maxsize 12 --value '$(PKG_TITLE_ID)'
+	@$(PKGTOOL) sfo_setentry $@ VERSION --type Utf8 --maxsize 8 --value '$(PKG_VERSION)'
+
+PKG_FILES := eboot.bin sce_sys/about/right.sprx sce_sys/param.sfo \
+             sce_sys/icon0.png sce_module/libc.prx sce_module/libSceFios2.prx
+
+# Build the .gp4 manifest from the package files
+pkg.gp4: $(TEST_SELF) sce_sys/param.sfo sce_sys/about/right.sprx sce_sys/icon0.png \
+         sce_module/libc.prx sce_module/libSceFios2.prx
+	@echo "  GP4 $@"
+	@$(MKGP4) -out=$@ -content-id=$(PKG_CONTENT_ID) \
+	    -files="$(PKG_FILES)"
+
+# Final application package
+$(PKG_CONTENT_ID).pkg: pkg.gp4
+	@echo "  PKG $@"
+	@$(PKGTOOL) pkg_build $< .
+
 # === Clean ===
 clean:
-	rm -f $(VK_PS4_OBJS) $(LIB_SHARED) $(LIB_STATIC)
+	rm -f $(VK_PS4_OBJS) $(LIB_SHARED) $(LIB_STATIC) \
+	      $(TEST_OBJ) $(MESA_STUBS_OBJ) $(TEST_ELF) $(TEST_OELF) $(TEST_SELF) $(EBOOT) \
+	      pkg.gp4 sce_sys/param.sfo sce_sys/about/right.sprx sce_sys/icon0.png \
+	      sce_module/libc.prx sce_module/libSceFios2.prx $(PKG_CONTENT_ID).pkg
+	@rm -rf sce_sys sce_module
 
 # === Info ===
 info:
@@ -155,3 +287,8 @@ info:
 	@echo "LD: $(LD)"
 	@echo "LDFLAGS_SHARED: $(LDFLAGS_SHARED)"
 	@echo "Sources: $(VK_PS4_SRCS)"
+	@echo "MKFSELF: $(MKFSELF)"
+	@echo "MKGP4: $(MKGP4)"
+	@echo "PKGTOOL: $(PKGTOOL)"
+	@echo "Test self: $(TEST_SELF)"
+	@echo "Package: $(PKG_CONTENT_ID).pkg"

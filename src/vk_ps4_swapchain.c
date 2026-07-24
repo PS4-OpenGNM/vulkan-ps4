@@ -96,6 +96,10 @@ vk_ps4_CreateSwapchainKHR(VkDevice device, const VkSwapchainCreateInfoKHR *pCrea
         img->is_render_target = true;
         img->layout = VK_IMAGE_LAYOUT_UNDEFINED;
         img->memory = NULL;
+        /* Mark as swapchain image for WaitUntilSafeForRendering. */
+        img->is_swapchain_image = true;
+        img->video_out_handle = sc->video_out.handle;
+        img->swapchain_buffer_index = i;
 
         /* Set up render target descriptor pointing to the VideoOut buffer */
         void *buffer = sceGnmVideoOutGetBuffer(&sc->video_out, i);
@@ -136,6 +140,12 @@ vk_ps4_DestroySwapchainKHR(VkDevice device, VkSwapchainKHR swapchain, const VkAl
     VkPs4Swapchain *sc = (VkPs4Swapchain *)swapchain;
     const VkAllocationCallbacks *alloc = pAllocator ? pAllocator : &dev->allocator;
 
+    /* Wait for GPU to finish any in-flight work on swapchain images
+     * before freeing them.  The Vulkan spec says the app must not
+     * destroy a swapchain while images are in use, but be defensive
+     * to avoid GPU faults or memory corruption. */
+    vk_ps4_DeviceWaitIdle(device);
+
     if (sc->images) {
         vk_ps4_free(alloc, sc->images);
     }
@@ -171,8 +181,6 @@ vk_ps4_GetSwapchainImagesKHR(VkDevice device, VkSwapchainKHR swapchain,
 VKAPI_ATTR VkResult VKAPI_CALL
 vk_ps4_AcquireNextImageKHR(VkDevice device, VkSwapchainKHR swapchain, uint64_t timeout,
                            VkSemaphore semaphore, VkFence fence, uint32_t *pImageIndex) {
-    (void)device;
-    (void)timeout;
     if (!swapchain || !pImageIndex) {
         return VK_ERROR_INITIALIZATION_FAILED;
     }
@@ -181,13 +189,107 @@ vk_ps4_AcquireNextImageKHR(VkDevice device, VkSwapchainKHR swapchain, uint64_t t
         return VK_ERROR_SURFACE_LOST_KHR;
     }
 
-    /* MVP: round-robin buffer selection.
-     * Not thread-safe — caller must synchronize AcquireNextImageKHR calls.
-     * No GPU sync — MVP assumes synchronous submit. */
-    *pImageIndex = sc->current_image;
-    sc->current_image = (sc->current_image + 1) % sc->image_count;
+    /* Find an available image.  An image is available if it is not
+     * in-flight (image_in_flight[idx] == false).  If the caller
+     * previously passed a fence, we check it as an optimization to
+     * reclaim images whose GPU work has completed even before the
+     * present call.  We search starting from current_image to
+     * distribute load across buffers. */
+    uint32_t acquired = sc->image_count;  /* invalid sentinel */
+    for (uint32_t attempt = 0; attempt < sc->image_count; attempt++) {
+        uint32_t idx = (sc->current_image + attempt) % sc->image_count;
+        if (!sc->image_in_flight[idx]) {
+            /* Image is free */
+            acquired = idx;
+            break;
+        }
+        /* Image is in-flight — check if its fence has been signaled.
+         * If so, the GPU work is done and we can reclaim it early
+         * (even before QueuePresentKHR clears the in-flight flag). */
+        if (sc->image_fences[idx]) {
+            VkPs4Fence *f = (VkPs4Fence *)sc->image_fences[idx];
+            bool done = f->signaled;
+            if (!done && f->label) {
+                done = (*f->label == f->signal_value);
+            }
+            if (done) {
+                sc->image_in_flight[idx] = false;
+                sc->image_fences[idx] = NULL;
+                acquired = idx;
+                break;
+            }
+        }
+    }
 
-    /* Signal semaphore and fence (synchronous in MVP — submit is blocking) */
+    if (acquired >= sc->image_count) {
+        /* All images are in flight.  Wait for any one to become available.
+         * Collect all in-flight fences and wait with waitAll=false so
+         * we wait up to `timeout` for ANY fence, not the full timeout
+         * per fence. */
+        VkFence wait_fences[GNM_VIDEO_OUT_MAX_BUFFERS];
+        uint32_t wait_count = 0;
+        for (uint32_t i = 0; i < sc->image_count; i++) {
+            if (sc->image_fences[i]) {
+                wait_fences[wait_count++] = sc->image_fences[i];
+            }
+        }
+        if (wait_count > 0) {
+            VkResult wr = vk_ps4_WaitForFences(
+                device, wait_count, wait_fences, VK_FALSE, timeout
+            );
+            if (wr != VK_SUCCESS) {
+                return wr;  /* VK_TIMEOUT or error */
+            }
+            /* Find which fence signaled and reclaim its image. */
+            for (uint32_t i = 0; i < sc->image_count; i++) {
+                if (sc->image_fences[i]) {
+                    VkPs4Fence *f = (VkPs4Fence *)sc->image_fences[i];
+                    bool done = f->signaled;
+                    if (!done && f->label) {
+                        done = (*f->label == f->signal_value);
+                    }
+                    if (done) {
+                        sc->image_in_flight[i] = false;
+                        sc->image_fences[i] = NULL;
+                        acquired = i;
+                        break;
+                    }
+                }
+            }
+            if (acquired >= sc->image_count) {
+                /* WaitForFences returned success but we didn't find
+                 * a signaled fence — shouldn't happen, but handle it. */
+                acquired = sc->current_image;
+            }
+        } else {
+            /* No fences to wait on (all semaphore-only sync).
+             * Wait for all GPU work to complete before reusing the
+             * image, since we have no per-image fence to wait on.
+             * This is conservative but correct — without it, the GPU
+             * may still be rendering to the buffer we're about to
+             * hand back to the caller. */
+            vk_ps4_DeviceWaitIdle(device);
+            /* Clear all in-flight flags since the GPU is now idle. */
+            for (uint32_t i = 0; i < sc->image_count; i++) {
+                sc->image_in_flight[i] = false;
+            }
+            acquired = sc->current_image;
+        }
+    }
+
+    /* Mark this image as in-flight */
+    sc->image_in_flight[acquired] = true;
+    sc->image_fences[acquired] = fence;  /* may be NULL */
+    sc->current_image = (acquired + 1) % sc->image_count;
+    *pImageIndex = acquired;
+
+    /* Signal semaphore and fence.  Per Vulkan spec, the semaphore/fence
+     * passed to AcquireNextImageKHR is signaled when the image is
+     * available, which is now.  We only set the CPU-side signaled flag
+     * — we do NOT increment signal_value or write the GPU label, because
+     * QueueSubmit owns GPU-side signaling (EOP writes).  Touching
+     * signal_value here would cause a double-increment if the caller
+     * reuses the same fence/semaphore with QueueSubmit. */
     if (semaphore) {
         VkPs4Semaphore *sem = (VkPs4Semaphore *)semaphore;
         sem->signaled = true;
@@ -210,17 +312,21 @@ vk_ps4_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR *pPresentInfo) {
     }
     VkPs4Queue *q = (VkPs4Queue *)queue;
 
-    /* Wait on semaphores (MVP: CPU-tracked, just check signaled flag) */
+    /* Wait on semaphores.  On host, semaphores are CPU-tracked and
+     * signaled synchronously by QueueSubmit, so we just reset them.
+     * On Orbis, the GPU-side WaitMem in QueueSubmit ensures the GPU
+     * has completed the semaphore's signaling work before we present. */
     for (uint32_t s = 0; s < pPresentInfo->waitSemaphoreCount; s++) {
         VkPs4Semaphore *sem = (VkPs4Semaphore *)pPresentInfo->pWaitSemaphores[s];
         if (sem) {
-            /* MVP: semaphores are signaled synchronously, so just reset */
             sem->signaled = false;
         }
     }
 
-    /* For MVP, just signal the swapchain's video out flip.
-     * Real implementation would submit the command buffer with a flip. */
+    /* Submit flip for each swapchain.  After the flip completes
+     * (sceGnmVideoOutSubmitFlipAndWait is blocking), the image is
+     * no longer in flight — clear its fence so AcquireNextImageKHR
+     * can reclaim it. */
     for (uint32_t i = 0; i < pPresentInfo->swapchainCount; i++) {
         VkPs4Swapchain *sc = (VkPs4Swapchain *)pPresentInfo->pSwapchains[i];
         if (!sc) continue;
@@ -233,6 +339,11 @@ vk_ps4_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR *pPresentInfo) {
                 GNM_VIDEO_OUT_FLIP_VSYNC
             );
             sc->video_out.frame++;
+            /* The flip is complete — the display engine is done
+             * with the buffer.  Clear the in-flight tracking so
+             * AcquireNextImageKHR can reclaim this image. */
+            sc->image_in_flight[image_index] = false;
+            sc->image_fences[image_index] = NULL;
         }
     }
 

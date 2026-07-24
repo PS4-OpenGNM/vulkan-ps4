@@ -62,11 +62,11 @@ endif()
 # Vulkan ICD loader interface version
 add_compile_definitions(
     VK_PS4_VERSION_MAJOR=1
-    VK_PS4_VERSION_MINOR=0
+    VK_PS4_VERSION_MINOR=1
     VK_PS4_VERSION_PATCH=0
 )
 if(VK_PS4_ORBIS)
-    add_compile_definitions(VK_USE_PLATFORM_PS4)
+    add_compile_definitions(VK_USE_PLATFORM_PS4 ORBIS __ORBIS__ __PS4__)
 endif()
 
 # ICD sources
@@ -90,7 +90,9 @@ set(VK_PS4_SOURCES
     src/vk_ps4_swapchain.c
     src/vk_ps4_queue.c
     src/vk_ps4_sync.c
+    src/vk_ps4_query.c
     src/vk_ps4_stubs.c
+    src/vk_ps4_vulkan11.c
 )
 
 # Build as a shared library (ICD) on all platforms.
@@ -159,6 +161,33 @@ if(NOT VK_PS4_ORBIS)
     target_link_libraries(vk_ps4_descriptor_test PRIVATE vulkan_ps4)
     add_test(NAME descriptor_test COMMAND vk_ps4_descriptor_test
         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
+    # Validation layer test — goes through the Vulkan loader with VVL enabled
+    # Links ONLY against the system Vulkan loader (not our ICD directly).
+    # The loader discovers our ICD via VK_ICD_FILENAMES at runtime.
+    add_executable(vk_ps4_validation_test tests/test_validation.c)
+    find_library(VK_LOADER_LIBRARY NAMES vulkan PATHS /opt/homebrew/lib NO_DEFAULT_PATH)
+    if(VK_LOADER_LIBRARY)
+        target_link_libraries(vk_ps4_validation_test PRIVATE ${VK_LOADER_LIBRARY})
+        message(STATUS "Found Vulkan loader: ${VK_LOADER_LIBRARY}")
+    else()
+        target_link_libraries(vk_ps4_validation_test PRIVATE "-lvulkan")
+        message(STATUS "Using -lvulkan for loader")
+    endif()
+    add_test(NAME validation_test COMMAND vk_ps4_validation_test
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+    set_tests_properties(validation_test PROPERTIES
+        ENVIRONMENT
+            "VK_ICD_FILENAMES=${CMAKE_BINARY_DIR}/vulkan_ps4_icd.json;VK_LAYER_PATH=/opt/homebrew/opt/vulkan-validationlayers/share/vulkan/explicit_layer.d;DYLD_LIBRARY_PATH=/opt/homebrew/opt/vulkan-validationlayers/lib")
+
+    # Dolphin compatibility test — mimics Dolphin's VulkanContext init path
+    add_executable(vk_ps4_dolphin_compat_test tests/test_dolphin_compat.c)
+    target_link_libraries(vk_ps4_dolphin_compat_test PRIVATE ${VK_LOADER_LIBRARY})
+    add_test(NAME dolphin_compat_test COMMAND vk_ps4_dolphin_compat_test
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+    set_tests_properties(dolphin_compat_test PROPERTIES
+        ENVIRONMENT
+            "VK_ICD_FILENAMES=${CMAKE_BINARY_DIR}/vulkan_ps4_icd.json")
 endif()
 
 # Install
@@ -169,3 +198,12 @@ install(TARGETS vulkan_ps4
 install(DIRECTORY include/
     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/vulkan_ps4
 )
+
+# Generate ICD manifest with the correct library path for the build tree
+if(NOT VK_PS4_ORBIS)
+    configure_file(
+        ${CMAKE_CURRENT_SOURCE_DIR}/vulkan_ps4_icd.json.in
+        ${CMAKE_BINARY_DIR}/vulkan_ps4_icd.json
+        @ONLY
+    )
+endif()

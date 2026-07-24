@@ -81,13 +81,46 @@ vk_ps4_CreateImage(VkDevice device, const VkImageCreateInfo *pCreateInfo,
             return VK_ERROR_OUT_OF_DEVICE_MEMORY;
         }
     } else if (vk_image_is_depth(pCreateInfo)) {
-        /* Depth/stencil target — for Phase 1, store as render target with
-         * zeroed descriptor. Full depth target (GnmDepthRenderTarget) support
-         * is Phase 3. Mark is_render_target=false so BindImageMemory and
-         * GetImageMemoryRequirements use the texture path as fallback. */
+        /* Depth/stencil target — create a GnmDepthRenderTarget. */
+        img->is_depth_target = true;
         img->is_render_target = false;
         memset(&img->gnm_rt, 0, sizeof(img->gnm_rt));
-        /* Initialize a minimal texture descriptor for size calculation */
+
+        /* Map VkFormat to GnmZFormat and GnmStencilFormat */
+        GnmZFormat zfmt = GNM_Z_INVALID;
+        GnmStencilFormat sfmt = GNM_STENCIL_INVALID;
+        switch (pCreateInfo->format) {
+        case VK_FORMAT_D16_UNORM:
+            zfmt = GNM_Z_16; sfmt = GNM_STENCIL_INVALID; break;
+        case VK_FORMAT_D32_SFLOAT:
+            zfmt = GNM_Z_32_FLOAT; sfmt = GNM_STENCIL_INVALID; break;
+        case VK_FORMAT_D24_UNORM_S8_UINT:
+            zfmt = GNM_Z_24; sfmt = GNM_STENCIL_8; break;
+        case VK_FORMAT_D32_SFLOAT_S8_UINT:
+            zfmt = GNM_Z_32_FLOAT; sfmt = GNM_STENCIL_8; break;
+        default:
+            zfmt = GNM_Z_32_FLOAT; sfmt = GNM_STENCIL_INVALID; break;
+        }
+
+        GnmDepthRenderTargetCreateInfo drt_ci;
+        memset(&drt_ci, 0, sizeof(drt_ci));
+        drt_ci.width = pCreateInfo->extent.width;
+        drt_ci.height = pCreateInfo->extent.height;
+        drt_ci.numslices = pCreateInfo->arrayLayers;
+        drt_ci.zfmt = zfmt;
+        drt_ci.stencilfmt = sfmt;
+        drt_ci.tilemodehint = GNM_TM_DISPLAY_2D_THIN;
+        drt_ci.mingpumode = gpu_mode;
+        drt_ci.numfragments = 1;
+        GnmError err = sceGnmCreateDepthRenderTarget(&img->gnm_drt, &drt_ci);
+        if (err != GNM_ERROR_OK) {
+            /* Fallback: zeroed DRT, use texture path for size calc */
+            memset(&img->gnm_drt, 0, sizeof(img->gnm_drt));
+            img->is_depth_target = false;
+        }
+
+        /* Also initialize a minimal texture descriptor for size calculation
+         * when the DRT creation fails or for sampled depth textures. */
         GnmTextureCreateInfo tex_ci;
         memset(&tex_ci, 0, sizeof(tex_ci));
         tex_ci.format = gnm_fmt;
@@ -223,13 +256,38 @@ vk_ps4_CreateImageView(VkDevice device, const VkImageViewCreateInfo *pCreateInfo
     }
     view->create_info = *pCreateInfo;
 
-    /* For render target images, the view is the same RT descriptor.
-     * For texture images, copy the texture descriptor.
+    /* For texture images, copy the texture descriptor.
+     * For render target images, build a GnmTexture from the GnmRenderTarget
+     * so the RT can be sampled as a texture (RT-as-texture).
      * Note: if BindImageMemory hasn't been called yet, the descriptor
      * has a zero base address. The view must be created after binding
      * for correct GPU operation. This is a known limitation. */
     if (!view->image->is_render_target) {
         view->gnm_view = view->image->gnm_texture;
+    } else {
+        /* Convert the GnmRenderTarget to a GnmTexture descriptor.
+         * We use the RT's actual pixel dimensions (rt->size.width/height)
+         * rather than sceGnmRtBuildInfo's width field, which is the pitch
+         * in pixels — sceGnmTexCreate2d expects the real width and
+         * calculates the pitch internally from width + format. */
+        GnmRenderTarget *rt = &view->image->gnm_rt;
+        GpaTextureInfo rt_info = sceGnmRtBuildInfo(rt);
+        void *rt_base = sceGnmRtGetBaseAddr(rt);
+        uint32_t rt_width = rt->size.width;
+        uint32_t rt_height = rt->size.height;
+        uint64_t tex_size = 0;
+        uint32_t tex_align = 0;
+        GnmError tex_err = sceGnmTexCreate2d(
+            &view->gnm_view, rt_base, rt_info.fmt,
+            rt_width, rt_height, rt_info.nummips,
+            rt_info.tm, rt_info.mingpumode,
+            &tex_size, &tex_align
+        );
+        if (tex_err != GNM_ERROR_OK) {
+            /* Fall back to a zeroed descriptor — the view won't sample
+             * correctly but won't crash. */
+            memset(&view->gnm_view, 0, sizeof(GnmTexture));
+        }
     }
 
     *pImageView = (VkImageView)view;

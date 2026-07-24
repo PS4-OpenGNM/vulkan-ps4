@@ -113,7 +113,7 @@ int main(void) {
         /* Get properties */
         VkPhysicalDeviceProperties props;
         vkGetPhysicalDeviceProperties(phys, &props);
-        CHECK(props.apiVersion == VK_MAKE_VERSION(1, 0, 0), "API version is 1.0");
+        CHECK(props.apiVersion == VK_MAKE_VERSION(1, 1, 0), "API version is 1.1");
         CHECK(props.vendorID == 0x1002, "Vendor ID is AMD");
 
         /* Get memory properties */
@@ -329,16 +329,24 @@ int main(void) {
 
         uint32_t dev_ext_count = 0;
         vkEnumerateDeviceExtensionProperties(phys, NULL, &dev_ext_count, NULL);
-        CHECK(dev_ext_count == 1, "Device extension count is 1 (only swapchain)");
+        CHECK(dev_ext_count >= 2, "Device extension count >= 2 (swapchain + renderpass2)");
 
-        VkExtensionProperties ext[4];
+        VkExtensionProperties ext[32];
         vkEnumerateDeviceExtensionProperties(phys, NULL, &dev_ext_count, ext);
-        CHECK(strcmp(ext[0].extensionName, VK_KHR_SWAPCHAIN_EXTENSION_NAME) == 0,
-              "Device extension is VK_KHR_swapchain");
+        bool has_swapchain = false;
+        bool has_renderpass2 = false;
+        for (uint32_t i = 0; i < dev_ext_count; i++) {
+            if (strcmp(ext[i].extensionName, VK_KHR_SWAPCHAIN_EXTENSION_NAME) == 0)
+                has_swapchain = true;
+            if (strcmp(ext[i].extensionName, VK_KHR_CREATE_RENDERPASS_2_EXTENSION_NAME) == 0)
+                has_renderpass2 = true;
+        }
+        CHECK(has_swapchain, "Device extensions include VK_KHR_swapchain");
+        CHECK(has_renderpass2, "Device extensions include VK_KHR_create_renderpass2");
 
         uint32_t inst_ext_count = 0;
         vkEnumerateInstanceExtensionProperties(NULL, &inst_ext_count, NULL);
-        CHECK(inst_ext_count == 1, "Instance extension count is 1 (only surface)");
+        CHECK(inst_ext_count >= 1, "Instance extension count >= 1 (surface)");
 
         vkDestroyInstance(inst, NULL);
     }

@@ -127,6 +127,135 @@ vk_ps4_CreateInstance(
     phys->features.variableMultisampleRate = VK_TRUE;
     phys->features.inheritedQueries = VK_FALSE;
 
+    /* Physical device limits — PS4 Liverpool GPU (GCN 1.0 / GFX7).
+     * These values match the PS4 hardware capabilities.  VVL checks
+     * many of these against application requests, so they must be
+     * non-zero where the hardware supports the feature. */
+    VkPhysicalDeviceLimits *l = &phys->properties.limits;
+    l->maxImageDimension1D = 16384;
+    l->maxImageDimension2D = 16384;
+    l->maxImageDimension3D = 2048;
+    l->maxImageDimensionCube = 16384;
+    l->maxImageArrayLayers = 2048;
+    l->maxTexelBufferElements = 134217728;  /* 128M */
+    l->maxUniformBufferRange = 65536;       /* 64KB (GCN UBO limit) */
+    l->maxStorageBufferRange = 4294967295U; /* 4GB */
+    l->maxPushConstantsSize = 256;
+    l->maxMemoryAllocationCount = 4096;
+    l->maxSamplerAllocationCount = 1048576;  /* 1M */
+    l->bufferImageGranularity = 1;           /* no granularity constraint */
+    l->sparseAddressSpaceSize = 0;           /* no sparse support */
+    l->maxBoundDescriptorSets = 8;
+    l->maxPerStageDescriptorSamplers = 16;
+    l->maxPerStageDescriptorUniformBuffers = 12;
+    l->maxPerStageDescriptorStorageBuffers = 8;
+    l->maxPerStageDescriptorSampledImages = 16;
+    l->maxPerStageDescriptorStorageImages = 8;
+    l->maxPerStageDescriptorInputAttachments = 8;
+    l->maxPerStageResources = 32;
+    l->maxDescriptorSetSamplers = 96;        /* 16 * 6 stages (VS, TCS, TES, GS, FS, CS) */
+    l->maxDescriptorSetUniformBuffers = 72;
+    l->maxDescriptorSetUniformBuffersDynamic = 72;
+    l->maxDescriptorSetStorageBuffers = 48;
+    l->maxDescriptorSetStorageBuffersDynamic = 24;
+    l->maxDescriptorSetSampledImages = 96;
+    l->maxDescriptorSetStorageImages = 48;
+    l->maxDescriptorSetInputAttachments = 48;
+    l->maxVertexInputAttributes = 32;
+    l->maxVertexInputBindings = 32;
+    l->maxVertexInputAttributeOffset = 2047;
+    l->maxVertexInputBindingStride = 2048;
+    l->maxVertexOutputComponents = 128;
+    l->maxTessellationGenerationLevel = 64;
+    l->maxTessellationPatchSize = 32;
+    l->maxTessellationControlPerVertexInputComponents = 128;
+    l->maxTessellationControlPerVertexOutputComponents = 128;
+    l->maxTessellationControlPerPatchOutputComponents = 120;
+    l->maxTessellationControlTotalOutputComponents = 4096;
+    l->maxTessellationEvaluationInputComponents = 128;
+    l->maxTessellationEvaluationOutputComponents = 128;
+    l->maxGeometryShaderInvocations = 127;
+    l->maxGeometryInputComponents = 128;
+    l->maxGeometryOutputComponents = 128;
+    l->maxGeometryOutputVertices = 1024;
+    l->maxGeometryTotalOutputComponents = 4096;
+    l->maxFragmentInputComponents = 128;
+    l->maxFragmentOutputAttachments = 8;
+    l->maxFragmentDualSrcAttachments = 1;
+    l->maxFragmentCombinedOutputResources = 8;
+    l->maxComputeSharedMemorySize = 32768;   /* 32KB LDS */
+    l->maxComputeWorkGroupCount[0] = 65535;
+    l->maxComputeWorkGroupCount[1] = 65535;
+    l->maxComputeWorkGroupCount[2] = 65535;
+    l->maxComputeWorkGroupInvocations = 1024;
+    l->maxComputeWorkGroupSize[0] = 1024;
+    l->maxComputeWorkGroupSize[1] = 1024;
+    l->maxComputeWorkGroupSize[2] = 1024;
+    l->subPixelPrecisionBits = 8;
+    l->subTexelPrecisionBits = 8;
+    l->mipmapPrecisionBits = 8;
+    l->maxDrawIndexedIndexValue = 4294967295U;  /* uint32 */
+    l->maxDrawIndirectCount = 4294967295U;
+    l->maxSamplerLodBias = 16.0f;
+    l->maxSamplerAnisotropy = 16.0f;
+    l->maxViewports = 16;
+    l->maxViewportDimensions[0] = 4096;
+    l->maxViewportDimensions[1] = 4096;
+    l->viewportBoundsRange[0] = -32768.0f;
+    l->viewportBoundsRange[1] = 32767.0f;
+    l->viewportSubPixelBits = 8;
+    l->minMemoryMapAlignment = 64;            /* Garlic 64-byte alignment */
+    l->minTexelBufferOffsetAlignment = 4;     /* 1 texel (R32) */
+    l->minUniformBufferOffsetAlignment = 256; /* GCN UBO alignment */
+    l->minStorageBufferOffsetAlignment = 4;
+    l->minTexelOffset = -64;
+    l->maxTexelOffset = 63;
+    l->minTexelGatherOffset = -32;
+    l->maxTexelGatherOffset = 31;
+    l->minInterpolationOffset = -2.0f;
+    l->maxInterpolationOffset = 1.0f;
+    l->subPixelInterpolationOffsetBits = 8;
+    l->maxFramebufferWidth = 4096;
+    l->maxFramebufferHeight = 4096;
+    l->maxFramebufferLayers = 2048;
+    l->framebufferColorSampleCounts = VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_2_BIT |
+                                      VK_SAMPLE_COUNT_4_BIT | VK_SAMPLE_COUNT_8_BIT;
+    l->framebufferDepthSampleCounts = VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_2_BIT |
+                                      VK_SAMPLE_COUNT_4_BIT | VK_SAMPLE_COUNT_8_BIT;
+    l->framebufferStencilSampleCounts = VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_2_BIT |
+                                        VK_SAMPLE_COUNT_4_BIT | VK_SAMPLE_COUNT_8_BIT;
+    l->framebufferNoAttachmentsSampleCounts = VK_SAMPLE_COUNT_1_BIT;
+    l->maxColorAttachments = 8;
+    l->sampledImageColorSampleCounts = VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_2_BIT |
+                                       VK_SAMPLE_COUNT_4_BIT | VK_SAMPLE_COUNT_8_BIT;
+    l->sampledImageIntegerSampleCounts = VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_2_BIT |
+                                         VK_SAMPLE_COUNT_4_BIT | VK_SAMPLE_COUNT_8_BIT;
+    l->sampledImageDepthSampleCounts = VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_2_BIT |
+                                       VK_SAMPLE_COUNT_4_BIT | VK_SAMPLE_COUNT_8_BIT;
+    l->sampledImageStencilSampleCounts = VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_2_BIT |
+                                         VK_SAMPLE_COUNT_4_BIT | VK_SAMPLE_COUNT_8_BIT;
+    l->storageImageSampleCounts = VK_SAMPLE_COUNT_1_BIT;
+    l->standardSampleLocations = VK_TRUE;
+    l->optimalBufferCopyOffsetAlignment = 1;
+    l->optimalBufferCopyRowPitchAlignment = 1;
+    l->nonCoherentAtomSize = 64;  /* Garlic cache line */
+
+    /* Missing required limits — spec minimums / feature consistency */
+    l->maxSampleMaskWords = 1;
+    l->timestampComputeAndGraphics = VK_TRUE;  /* queue reports timestampValidBits=64 */
+    l->timestampPeriod = 1.0f;                  /* ns per timestamp tick */
+    l->maxClipDistances = 8;                     /* shaderClipDistance = VK_TRUE */
+    l->maxCullDistances = 8;                     /* shaderCullDistance = VK_TRUE */
+    l->maxCombinedClipAndCullDistances = 8;
+    l->discreteQueuePriorities = 2;
+    l->pointSizeRange[0] = 1.0f;                 /* largePoints = VK_TRUE */
+    l->pointSizeRange[1] = 64.0f;
+    l->lineWidthRange[0] = 1.0f;                 /* wideLines = VK_FALSE, so [1,1] */
+    l->lineWidthRange[1] = 1.0f;
+    l->pointSizeGranularity = 1.0f;
+    l->lineWidthGranularity = 1.0f;
+    l->strictLines = VK_FALSE;
+
     inst->physical_device = phys;
     *pInstance = (VkInstance)inst;
     return VK_SUCCESS;

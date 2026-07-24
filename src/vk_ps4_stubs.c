@@ -4,7 +4,12 @@
  * Phase 1 implements: memory, buffer, image, render pass, framebuffer, shader,
  * pipeline, command buffer, swapchain, queue, sync.
  *
- * Remaining stubs: query pool (Phase 3), some copy/blit commands (Phase 2),
+ * Phase 2 implements: descriptors, compute pipelines, texture copy/blit/barriers.
+ *
+ * Phase 3 implements: GNM device lifecycle (init/teardown), EOP fence/semaphore
+ * sync, query pools (occlusion + timestamp + copy results).
+ *
+ * Remaining stubs: some copy/blit commands (full 3D->2D blit, shader-based copy),
  * and the stub shader compile path (when libpsbc is unavailable).
  */
 

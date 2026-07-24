@@ -301,6 +301,11 @@ vk_ps4_CreateGraphicsPipelines(VkDevice device, VkPipelineCache pipelineCache,
                 mod, stage->stage, alloc, &binary, &binary_size, &metadata
             );
             if (vr != VK_SUCCESS) {
+                /* Compile failed — free the binary if one was allocated
+                 * (stub mode returns mod->binary which we don't own). */
+                if (binary && binary != mod->binary) {
+                    vk_ps4_free(alloc, binary);
+                }
                 compile_ok = false;
                 break;
             }
@@ -328,6 +333,12 @@ vk_ps4_CreateGraphicsPipelines(VkDevice device, VkPipelineCache pipelineCache,
                             (const GnmLsStageRegisters *)(stage_ptr + sizeof(GnmShaderCommonData));
                         pipe->ls_regs = *ls_regs;
                         pipe->has_ls = true;
+                        /* Patch the shader code address from file-offset
+                         * to actual GPU address in the compiled binary. */
+                        if (metadata.shadercode) {
+                            sceGnmLsRegsSetAddress(&pipe->ls_regs,
+                                (void *)metadata.shadercode);
+                        }
                         /* LS doesn't have vertex input semantics in the same
                          * format — skip semantic extraction for LS */
                     } else if (metadata.type == GNM_SHADER_EXPORT) {
@@ -336,10 +347,18 @@ vk_ps4_CreateGraphicsPipelines(VkDevice device, VkPipelineCache pipelineCache,
                             (const GnmEsStageRegisters *)(stage_ptr + sizeof(GnmShaderCommonData));
                         pipe->es_regs = *es_regs;
                         pipe->has_es = true;
+                        if (metadata.shadercode) {
+                            sceGnmEsRegsSetAddress(&pipe->es_regs,
+                                (void *)metadata.shadercode);
+                        }
                     } else {
                         /* Standard VS: GnmVsShader (common + regs + semantics) */
                         const GnmVsShader *vs = (const GnmVsShader *)metadata.stage;
                         pipe->vs_regs = vs->registers;
+                        if (metadata.shadercode) {
+                            sceGnmVsRegsSetAddress(&pipe->vs_regs,
+                                (void *)metadata.shadercode);
+                        }
                         /* Extract vertex input semantics */
                         uint32_t nsemantics = vs->numinputsemantics;
                         if (nsemantics > VK_PS4_MAX_INPUT_USAGE_SLOTS) nsemantics = VK_PS4_MAX_INPUT_USAGE_SLOTS;
@@ -360,6 +379,10 @@ vk_ps4_CreateGraphicsPipelines(VkDevice device, VkPipelineCache pipelineCache,
                 case VK_SHADER_STAGE_FRAGMENT_BIT: {
                     const GnmPsShader *ps = (const GnmPsShader *)metadata.stage;
                     pipe->ps_regs = ps->registers;
+                    if (metadata.shadercode) {
+                        sceGnmPsRegsSetAddress(&pipe->ps_regs,
+                            (void *)metadata.shadercode);
+                    }
                     pipe->fs_module = mod;
                     ps_found = true;
                     pipe->has_ps = true;
@@ -380,6 +403,10 @@ vk_ps4_CreateGraphicsPipelines(VkDevice device, VkPipelineCache pipelineCache,
                             (const GnmGsStageRegisters *)(stage_ptr + sizeof(GnmShaderCommonData));
                         pipe->gs_regs = *gs_regs;
                         pipe->has_gs = true;
+                        if (metadata.shadercode) {
+                            sceGnmGsRegsSetAddress(&pipe->gs_regs,
+                                (void *)metadata.shadercode);
+                        }
                     }
                     /* Store the module regardless — it may be used later
                      * when the compiler properly outputs GS binaries */
@@ -397,6 +424,10 @@ vk_ps4_CreateGraphicsPipelines(VkDevice device, VkPipelineCache pipelineCache,
                             (const GnmHsStageRegisters *)(stage_ptr + sizeof(GnmShaderCommonData));
                         pipe->hs_regs = *hs_regs;
                         pipe->has_hs = true;
+                        if (metadata.shadercode) {
+                            sceGnmHsRegsSetAddress(&pipe->hs_regs,
+                                (void *)metadata.shadercode);
+                        }
                     }
                     pipe->tcs_module = mod;
                     break;
@@ -412,12 +443,20 @@ vk_ps4_CreateGraphicsPipelines(VkDevice device, VkPipelineCache pipelineCache,
                             (const GnmEsStageRegisters *)(stage_ptr + sizeof(GnmShaderCommonData));
                         pipe->es_regs = *es_regs;
                         pipe->has_es = true;
+                        if (metadata.shadercode) {
+                            sceGnmEsRegsSetAddress(&pipe->es_regs,
+                                (void *)metadata.shadercode);
+                        }
                     } else {
                         /* DS_VS or compiler fallback: treat as vertex shader.
                          * Extract VS registers so CmdBindPipeline can use them. */
                         const GnmVsShader *vs = (const GnmVsShader *)metadata.stage;
                         pipe->vs_regs = vs->registers;
                         pipe->has_ds_vs = true;
+                        if (metadata.shadercode) {
+                            sceGnmVsRegsSetAddress(&pipe->vs_regs,
+                                (void *)metadata.shadercode);
+                        }
                     }
                     pipe->tes_module = mod;
                     break;
@@ -427,9 +466,20 @@ vk_ps4_CreateGraphicsPipelines(VkDevice device, VkPipelineCache pipelineCache,
                 }
             }
 
-            /* Free the compiled binary — stage registers are already extracted */
+            /* Keep the compiled binary alive for the pipeline's lifetime.
+             * The stage registers contain GPU addresses that point into
+             * this buffer (patched via sceGnm*RegsSetAddress above).
+             * Store in the per-stage field; freed in DestroyPipeline.
+             * Skip if binary == mod->binary (stub mode, no compilation). */
             if (binary && binary != mod->binary) {
-                vk_ps4_free(alloc, binary);
+                switch (stage->stage) {
+                case VK_SHADER_STAGE_VERTEX_BIT:            pipe->vs_binary = binary; break;
+                case VK_SHADER_STAGE_FRAGMENT_BIT:          pipe->ps_binary = binary; break;
+                case VK_SHADER_STAGE_GEOMETRY_BIT:          pipe->gs_binary = binary; break;
+                case VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT:    pipe->tcs_binary = binary; break;
+                case VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT: pipe->tes_binary = binary; break;
+                default: vk_ps4_free(alloc, binary); break;
+                }
             }
         }
 
@@ -439,6 +489,11 @@ vk_ps4_CreateGraphicsPipelines(VkDevice device, VkPipelineCache pipelineCache,
             vk_ps4_free(alloc, pipe->vertex_attributes);
             vk_ps4_free(alloc, pipe->blend_attachments);
             vk_ps4_free(alloc, pipe->fetch_shader);
+            if (pipe->vs_binary)  vk_ps4_free(alloc, pipe->vs_binary);
+            if (pipe->ps_binary)  vk_ps4_free(alloc, pipe->ps_binary);
+            if (pipe->gs_binary)  vk_ps4_free(alloc, pipe->gs_binary);
+            if (pipe->tcs_binary) vk_ps4_free(alloc, pipe->tcs_binary);
+            if (pipe->tes_binary) vk_ps4_free(alloc, pipe->tes_binary);
             vk_ps4_free(alloc, pipe);
             pPipelines[i] = VK_NULL_HANDLE;
             overall_result = VK_ERROR_FEATURE_NOT_PRESENT;
@@ -528,6 +583,46 @@ vk_ps4_CreateGraphicsPipelines(VkDevice device, VkPipelineCache pipelineCache,
         }
         skip_fetch_shader: ;
 
+        /* Extract push constant inline register mapping from input usage slots.
+         * psbc emits IMM_ALUFLOATCONST slots for each inlined push constant
+         * dword, with apislot = push constant dword index and
+         * startregister = user-data register. */
+        for (uint32_t s = 0; s < pipe->vs_input_usage_slot_count; s++) {
+            if (pipe->vs_input_usage_slots[s].usagetype == GNM_SHINPUTUSAGE_IMM_ALUFLOATCONST) {
+                uint8_t apislot = pipe->vs_input_usage_slots[s].apislot;
+                if (apislot == 0xFE) {
+                    /* base_vertex (vertexOffset) */
+                    pipe->vs_base_vertex_reg = pipe->vs_input_usage_slots[s].startregister;
+                    pipe->has_base_vertex_reg = true;
+                } else if (apislot == 0xFF) {
+                    /* start_instance (firstInstance) */
+                    pipe->vs_start_instance_reg = pipe->vs_input_usage_slots[s].startregister;
+                    pipe->has_start_instance_reg = true;
+                } else if (pipe->vs_push_const_slot_count < VK_PS4_MAX_PUSH_CONST_DWORDS) {
+                    /* Regular push constant dword */
+                    pipe->vs_push_const_slots[pipe->vs_push_const_slot_count].dword_index = apislot;
+                    pipe->vs_push_const_slots[pipe->vs_push_const_slot_count].user_data_reg =
+                        pipe->vs_input_usage_slots[s].startregister;
+                    pipe->vs_push_const_slot_count++;
+                }
+            }
+        }
+        for (uint32_t s = 0; s < pipe->ps_input_usage_slot_count; s++) {
+            if (pipe->ps_input_usage_slots[s].usagetype == GNM_SHINPUTUSAGE_IMM_ALUFLOATCONST) {
+                uint8_t apislot = pipe->ps_input_usage_slots[s].apislot;
+                /* Skip 0xFE/0xFF — these are VS-only special slots
+                 * for base_vertex/start_instance. They should never
+                 * appear in PS, but filter defensively. */
+                if (apislot >= 0xFE) continue;
+                if (pipe->ps_push_const_slot_count < VK_PS4_MAX_PUSH_CONST_DWORDS) {
+                    pipe->ps_push_const_slots[pipe->ps_push_const_slot_count].dword_index = apislot;
+                    pipe->ps_push_const_slots[pipe->ps_push_const_slot_count].user_data_reg =
+                        pipe->ps_input_usage_slots[s].startregister;
+                    pipe->ps_push_const_slot_count++;
+                }
+            }
+        }
+
         pPipelines[i] = (VkPipeline)pipe;
     }
 
@@ -572,6 +667,9 @@ vk_ps4_CreateComputePipelines(VkDevice device, VkPipelineCache pipelineCache,
             mod, ci->stage.stage, alloc, &binary, &binary_size, &metadata
         );
         if (vr != VK_SUCCESS) {
+            if (binary && binary != mod->binary) {
+                vk_ps4_free(alloc, binary);
+            }
             vk_ps4_free(alloc, pipe);
             pPipelines[i] = VK_NULL_HANDLE;
             overall_result = VK_ERROR_FEATURE_NOT_PRESENT;
@@ -620,7 +718,7 @@ vk_ps4_CreateComputePipelines(VkDevice device, VkPipelineCache pipelineCache,
                 /* Bounds check: ensure slot table fits within the binary */
                 uint32_t slots_bytes = (uint32_t)(sizeof(GnmShaderCommonData) +
                                    nslots * sizeof(GnmInputUsageSlot));
-                if (slots_bytes <= mod->binary_size) {
+                if (slots_bytes <= binary_size) {
                     const GnmInputUsageSlot *cs_slots =
                         (const GnmInputUsageSlot *)(base + sizeof(GnmShaderCommonData));
                     memcpy(pipe->vs_input_usage_slots, cs_slots,
@@ -629,14 +727,34 @@ vk_ps4_CreateComputePipelines(VkDevice device, VkPipelineCache pipelineCache,
                 }
             }
 
+            /* Extract push constant inline register mapping for CS.
+             * Filter out 0xFE/0xFF special slots (VS-only base_vertex/
+             * start_instance) defensively — they should never appear
+             * in a CS shader. */
+            for (uint32_t s = 0; s < pipe->vs_input_usage_slot_count; s++) {
+                if (pipe->vs_input_usage_slots[s].usagetype == GNM_SHINPUTUSAGE_IMM_ALUFLOATCONST) {
+                    uint8_t apislot = pipe->vs_input_usage_slots[s].apislot;
+                    if (apislot >= 0xFE) continue;
+                    if (pipe->cs_push_const_slot_count < VK_PS4_MAX_PUSH_CONST_DWORDS) {
+                        pipe->cs_push_const_slots[pipe->cs_push_const_slot_count].dword_index = apislot;
+                        pipe->cs_push_const_slots[pipe->cs_push_const_slot_count].user_data_reg =
+                            pipe->vs_input_usage_slots[s].startregister;
+                        pipe->cs_push_const_slot_count++;
+                    }
+                }
+            }
+
             cs_ok = true;
         }
 
+        /* Keep the compiled binary alive — cs_regs contains a GPU address
+         * that points into this buffer.  Freed in DestroyPipeline. */
         if (binary && binary != mod->binary) {
-            vk_ps4_free(alloc, binary);
+            pipe->cs_binary = binary;
         }
 
         if (!cs_ok) {
+            if (pipe->cs_binary) vk_ps4_free(alloc, pipe->cs_binary);
             vk_ps4_free(alloc, pipe);
             pPipelines[i] = VK_NULL_HANDLE;
             overall_result = VK_ERROR_FEATURE_NOT_PRESENT;
@@ -667,6 +785,14 @@ vk_ps4_DestroyPipeline(VkDevice device, VkPipeline pipeline, const VkAllocationC
     if (pipe->blend_attachments) {
         vk_ps4_free(alloc, pipe->blend_attachments);
     }
+    /* Free compiled GCN shader binaries (kept alive because stage
+     * registers contain GPU addresses pointing into them) */
+    if (pipe->vs_binary)  vk_ps4_free(alloc, pipe->vs_binary);
+    if (pipe->ps_binary)  vk_ps4_free(alloc, pipe->ps_binary);
+    if (pipe->gs_binary)  vk_ps4_free(alloc, pipe->gs_binary);
+    if (pipe->tcs_binary) vk_ps4_free(alloc, pipe->tcs_binary);
+    if (pipe->tes_binary) vk_ps4_free(alloc, pipe->tes_binary);
+    if (pipe->cs_binary)  vk_ps4_free(alloc, pipe->cs_binary);
     vk_ps4_free(alloc, pipe);
 }
 
@@ -747,6 +873,7 @@ vk_ps4_CreateDescriptorSetLayout(VkDevice device, const VkDescriptorSetLayoutCre
     layout->device = dev;
     layout->create_info = *pCreateInfo;
     layout->binding_count = pCreateInfo->bindingCount;
+    layout->variable_descriptor_binding = UINT32_MAX;
 
     if (layout->binding_count > 0) {
         layout->bindings = vk_ps4_alloc_zero(alloc,
@@ -766,6 +893,38 @@ vk_ps4_CreateDescriptorSetLayout(VkDevice device, const VkDescriptorSetLayoutCre
         layout->create_info.pBindings = layout->bindings;
     }
 
+    /* VK_EXT_descriptor_indexing: extract binding flags from pNext chain */
+    VkBaseInStructure *chain = (VkBaseInStructure *)pCreateInfo->pNext;
+    while (chain) {
+        if (chain->sType == VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO_EXT) {
+            VkDescriptorSetLayoutBindingFlagsCreateInfo *flags_info =
+                (VkDescriptorSetLayoutBindingFlagsCreateInfo *)chain;
+            if (flags_info->bindingCount > 0 && flags_info->pBindingFlags) {
+                uint32_t fcount = flags_info->bindingCount;
+                if (fcount > layout->binding_count) fcount = layout->binding_count;
+                layout->binding_flags = vk_ps4_alloc_zero(alloc,
+                    layout->binding_count * sizeof(VkDescriptorBindingFlags), 16);
+                if (!layout->binding_flags) {
+                    vk_ps4_free(alloc, layout->bindings);
+                    vk_ps4_free(alloc, layout);
+                    return VK_ERROR_OUT_OF_HOST_MEMORY;
+                }
+                memcpy(layout->binding_flags, flags_info->pBindingFlags,
+                       fcount * sizeof(VkDescriptorBindingFlags));
+                /* Find the variable-count binding (must be the last one
+                 * with VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT_EXT) */
+                for (uint32_t i = 0; i < fcount; i++) {
+                    if (flags_info->pBindingFlags[i] &
+                        VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT_EXT) {
+                        layout->variable_descriptor_binding = i;
+                    }
+                }
+            }
+            break;
+        }
+        chain = (VkBaseInStructure *)chain->pNext;
+    }
+
     *pSetLayout = (VkDescriptorSetLayout)layout;
     return VK_SUCCESS;
 }
@@ -776,6 +935,7 @@ vk_ps4_DestroyDescriptorSetLayout(VkDevice device, VkDescriptorSetLayout setLayo
     VkPs4Device *dev = (VkPs4Device *)device;
     VkPs4DescriptorSetLayout *layout = (VkPs4DescriptorSetLayout *)setLayout;
     const VkAllocationCallbacks *alloc = pAllocator ? pAllocator : &dev->allocator;
+    vk_ps4_free(alloc, layout->binding_flags);
     vk_ps4_free(alloc, layout->bindings);
     vk_ps4_free(alloc, layout);
 }
@@ -818,6 +978,21 @@ vk_ps4_AllocateDescriptorSets(VkDevice device, const VkDescriptorSetAllocateInfo
     VkPs4Device *dev = (VkPs4Device *)device;
     const VkAllocationCallbacks *alloc = &dev->allocator;
 
+    /* VK_EXT_descriptor_indexing: extract variable descriptor counts from pNext */
+    const uint32_t *var_counts = NULL;
+    uint32_t var_count_n = 0;
+    VkBaseInStructure *chain = (VkBaseInStructure *)pAllocateInfo->pNext;
+    while (chain) {
+        if (chain->sType == VK_STRUCTURE_TYPE_DESCRIPTOR_SET_VARIABLE_DESCRIPTOR_COUNT_ALLOCATE_INFO_EXT) {
+            VkDescriptorSetVariableDescriptorCountAllocateInfo *vc =
+                (VkDescriptorSetVariableDescriptorCountAllocateInfo *)chain;
+            var_counts = vc->pDescriptorCounts;
+            var_count_n = vc->descriptorSetCount;
+            break;
+        }
+        chain = (VkBaseInStructure *)chain->pNext;
+    }
+
     for (uint32_t i = 0; i < pAllocateInfo->descriptorSetCount; i++) {
         VkPs4DescriptorSet *set = vk_ps4_alloc_zero(alloc, sizeof(*set), 16);
         if (!set) {
@@ -831,6 +1006,7 @@ vk_ps4_AllocateDescriptorSets(VkDevice device, const VkDescriptorSetAllocateInfo
         set->device = dev;
         set->pool = (VkPs4DescriptorPool *)pAllocateInfo->descriptorPool;
         set->layout = (VkPs4DescriptorSetLayout *)pAllocateInfo->pSetLayouts[i];
+        set->variable_descriptor_count = 0;
 
         /* Initialize bindings from the layout */
         if (set->layout && set->layout->binding_count <= VK_PS4_MAX_DESCRIPTOR_BINDINGS) {
@@ -844,6 +1020,15 @@ vk_ps4_AllocateDescriptorSets(VkDevice device, const VkDescriptorSetAllocateInfo
                 set->bindings[b].textures = NULL;
                 set->bindings[b].samplers = NULL;
                 /* Resource arrays are allocated lazily in UpdateDescriptorSets */
+            }
+
+            /* VK_EXT_descriptor_indexing: override the variable-count binding's
+             * descriptor count if provided in the allocate info pNext chain. */
+            if (set->layout->variable_descriptor_binding != UINT32_MAX &&
+                var_counts && i < var_count_n) {
+                uint32_t vb = set->layout->variable_descriptor_binding;
+                set->bindings[vb].count = var_counts[i];
+                set->variable_descriptor_count = var_counts[i];
             }
         }
 
