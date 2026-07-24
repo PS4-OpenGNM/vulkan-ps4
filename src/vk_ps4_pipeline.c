@@ -101,7 +101,6 @@ vk_ps4_CreateGraphicsPipelines(VkDevice device, VkPipelineCache pipelineCache,
                                 const VkGraphicsPipelineCreateInfo *pCreateInfos,
                                 const VkAllocationCallbacks *pAllocator,
                                 VkPipeline *pPipelines) {
-    (void)pipelineCache;
 
     if (!device || !pCreateInfos || !pPipelines) {
         return VK_ERROR_INITIALIZATION_FAILED;
@@ -297,17 +296,47 @@ vk_ps4_CreateGraphicsPipelines(VkDevice device, VkPipelineCache pipelineCache,
             size_t binary_size = 0;
             GnmShaderMetadata metadata = {0};
 
-            VkResult vr = vk_ps4_compile_shader_module(
-                mod, stage->stage, alloc, &binary, &binary_size, &metadata
-            );
-            if (vr != VK_SUCCESS) {
-                /* Compile failed — free the binary if one was allocated
-                 * (stub mode returns mod->binary which we don't own). */
-                if (binary && binary != mod->binary) {
-                    vk_ps4_free(alloc, binary);
+            /* Check pipeline cache first — avoid recompiling if cached */
+            uint64_t cache_hash = 0;
+            size_t cached_size = 0;
+            void *cached_binary = NULL;
+            if (pipelineCache && mod->binary && mod->binary_size > 0) {
+                cache_hash = vk_ps4_pipeline_cache_hash(mod->binary, mod->binary_size,
+                                                        (uint32_t)stage->stage);
+                cached_binary = vk_ps4_pipeline_cache_lookup(pipelineCache, cache_hash,
+                                                             (uint32_t)stage->stage,
+                                                             &cached_size);
+            }
+
+            if (cached_binary && cached_size > 0) {
+                /* Cache hit — copy the binary (we need our own copy because
+                 * the cache may be destroyed before the pipeline) */
+                binary = vk_ps4_alloc(alloc, cached_size, 16);
+                if (binary) {
+                    memcpy(binary, cached_binary, cached_size);
+                    binary_size = cached_size;
+                    /* Parse metadata from the cached binary */
+                    sceGnmShaderBinaryGetMetadata(binary, binary_size, &metadata);
                 }
-                compile_ok = false;
-                break;
+            } else {
+                /* Cache miss — compile the shader */
+                VkResult vr = vk_ps4_compile_shader_module(
+                    mod, stage->stage, alloc, &binary, &binary_size, &metadata
+                );
+                if (vr != VK_SUCCESS) {
+                    if (binary && binary != mod->binary) {
+                        vk_ps4_free(alloc, binary);
+                    }
+                    compile_ok = false;
+                    break;
+                }
+                /* Insert into pipeline cache */
+                if (pipelineCache && binary && binary_size > 0 && mod->binary && mod->binary_size > 0) {
+                    vk_ps4_pipeline_cache_insert(pipelineCache, cache_hash,
+                                                 (uint32_t)stage->stage,
+                                                 (uint32_t)mod->binary_size,
+                                                 binary, binary_size);
+                }
             }
 
             /* Extract stage registers and input usage slots from the compiled shader binary */
@@ -635,7 +664,6 @@ vk_ps4_CreateComputePipelines(VkDevice device, VkPipelineCache pipelineCache,
                                const VkComputePipelineCreateInfo *pCreateInfos,
                                const VkAllocationCallbacks *pAllocator,
                                VkPipeline *pPipelines) {
-    (void)pipelineCache;
 
     if (!device || !pCreateInfos || !pPipelines) {
         return VK_ERROR_INITIALIZATION_FAILED;
@@ -663,17 +691,44 @@ vk_ps4_CreateComputePipelines(VkDevice device, VkPipelineCache pipelineCache,
         size_t binary_size = 0;
         GnmShaderMetadata metadata = {0};
 
-        VkResult vr = vk_ps4_compile_shader_module(
-            mod, ci->stage.stage, alloc, &binary, &binary_size, &metadata
-        );
-        if (vr != VK_SUCCESS) {
-            if (binary && binary != mod->binary) {
-                vk_ps4_free(alloc, binary);
+        /* Check pipeline cache first */
+        uint64_t cache_hash = 0;
+        size_t cached_size = 0;
+        void *cached_binary = NULL;
+        if (pipelineCache && mod->binary && mod->binary_size > 0) {
+            cache_hash = vk_ps4_pipeline_cache_hash(mod->binary, mod->binary_size,
+                                                    (uint32_t)ci->stage.stage);
+            cached_binary = vk_ps4_pipeline_cache_lookup(pipelineCache, cache_hash,
+                                                         (uint32_t)ci->stage.stage,
+                                                         &cached_size);
+        }
+
+        if (cached_binary && cached_size > 0) {
+            binary = vk_ps4_alloc(alloc, cached_size, 16);
+            if (binary) {
+                memcpy(binary, cached_binary, cached_size);
+                binary_size = cached_size;
+                sceGnmShaderBinaryGetMetadata(binary, binary_size, &metadata);
             }
-            vk_ps4_free(alloc, pipe);
-            pPipelines[i] = VK_NULL_HANDLE;
-            overall_result = VK_ERROR_FEATURE_NOT_PRESENT;
-            continue;
+        } else {
+            VkResult vr = vk_ps4_compile_shader_module(
+                mod, ci->stage.stage, alloc, &binary, &binary_size, &metadata
+            );
+            if (vr != VK_SUCCESS) {
+                if (binary && binary != mod->binary) {
+                    vk_ps4_free(alloc, binary);
+                }
+                vk_ps4_free(alloc, pipe);
+                pPipelines[i] = VK_NULL_HANDLE;
+                overall_result = VK_ERROR_FEATURE_NOT_PRESENT;
+                continue;
+            }
+            if (pipelineCache && binary && binary_size > 0 && mod->binary && mod->binary_size > 0) {
+                vk_ps4_pipeline_cache_insert(pipelineCache, cache_hash,
+                                             (uint32_t)ci->stage.stage,
+                                             (uint32_t)mod->binary_size,
+                                             binary, binary_size);
+            }
         }
 
         bool cs_ok = false;
@@ -966,6 +1021,11 @@ vk_ps4_DestroyDescriptorPool(VkDevice device, VkDescriptorPool descriptorPool, c
     VkPs4Device *dev = (VkPs4Device *)device;
     VkPs4DescriptorPool *pool = (VkPs4DescriptorPool *)descriptorPool;
     const VkAllocationCallbacks *alloc = pAllocator ? pAllocator : &dev->allocator;
+    /* Free all descriptor sets in the free list */
+    for (uint32_t i = 0; i < pool->free_count; i++) {
+        if (pool->free_list[i]) vk_ps4_free(alloc, pool->free_list[i]);
+    }
+    pool->free_count = 0;
     vk_ps4_free(alloc, pool);
 }
 
@@ -977,6 +1037,7 @@ vk_ps4_AllocateDescriptorSets(VkDevice device, const VkDescriptorSetAllocateInfo
     }
     VkPs4Device *dev = (VkPs4Device *)device;
     const VkAllocationCallbacks *alloc = &dev->allocator;
+    VkPs4DescriptorPool *pool = (VkPs4DescriptorPool *)pAllocateInfo->descriptorPool;
 
     /* VK_EXT_descriptor_indexing: extract variable descriptor counts from pNext */
     const uint32_t *var_counts = NULL;
@@ -994,17 +1055,30 @@ vk_ps4_AllocateDescriptorSets(VkDevice device, const VkDescriptorSetAllocateInfo
     }
 
     for (uint32_t i = 0; i < pAllocateInfo->descriptorSetCount; i++) {
-        VkPs4DescriptorSet *set = vk_ps4_alloc_zero(alloc, sizeof(*set), 16);
-        if (!set) {
-            for (uint32_t j = 0; j < i; j++) {
-                vk_ps4_free(alloc, (void *)pDescriptorSets[j]);
-                pDescriptorSets[j] = VK_NULL_HANDLE;
-            }
-            return VK_ERROR_OUT_OF_HOST_MEMORY;
+        VkPs4DescriptorSet *set = NULL;
+
+        /* Try to reuse from the pool's free list first */
+        if (pool && pool->free_count > 0) {
+            set = pool->free_list[--pool->free_count];
+            pool->free_list[pool->free_count] = NULL;
+            /* Clear the set for reuse */
+            memset(set, 0, sizeof(*set));
         }
+
+        if (!set) {
+            set = vk_ps4_alloc_zero(alloc, sizeof(*set), 16);
+            if (!set) {
+                for (uint32_t j = 0; j < i; j++) {
+                    vk_ps4_free(alloc, (void *)pDescriptorSets[j]);
+                    pDescriptorSets[j] = VK_NULL_HANDLE;
+                }
+                return VK_ERROR_OUT_OF_HOST_MEMORY;
+            }
+        }
+
         set->type = VK_PS4_OBJ_DESCRIPTOR_SET;
         set->device = dev;
-        set->pool = (VkPs4DescriptorPool *)pAllocateInfo->descriptorPool;
+        set->pool = pool;
         set->layout = (VkPs4DescriptorSetLayout *)pAllocateInfo->pSetLayouts[i];
         set->variable_descriptor_count = 0;
 
@@ -1032,6 +1106,7 @@ vk_ps4_AllocateDescriptorSets(VkDevice device, const VkDescriptorSetAllocateInfo
             }
         }
 
+        if (pool) pool->sets_allocated++;
         pDescriptorSets[i] = (VkDescriptorSet)set;
     }
     return VK_SUCCESS;
@@ -1040,21 +1115,26 @@ vk_ps4_AllocateDescriptorSets(VkDevice device, const VkDescriptorSetAllocateInfo
 VKAPI_ATTR VkResult VKAPI_CALL
 vk_ps4_FreeDescriptorSets(VkDevice device, VkDescriptorPool descriptorPool,
                           uint32_t descriptorSetCount, const VkDescriptorSet *pDescriptorSets) {
-    (void)descriptorPool;
     if (!device || !pDescriptorSets) return VK_SUCCESS;
     VkPs4Device *dev = (VkPs4Device *)device;
     const VkAllocationCallbacks *alloc = &dev->allocator;
+    VkPs4DescriptorPool *pool = (VkPs4DescriptorPool *)descriptorPool;
     for (uint32_t i = 0; i < descriptorSetCount; i++) {
-        if (pDescriptorSets[i]) {
-            VkPs4DescriptorSet *set = (VkPs4DescriptorSet *)pDescriptorSets[i];
-            /* Free binding resource arrays */
-            for (uint32_t b = 0; b < set->binding_count; b++) {
-                if (set->bindings[b].buffers) vk_ps4_free(alloc, set->bindings[b].buffers);
-                if (set->bindings[b].textures) vk_ps4_free(alloc, set->bindings[b].textures);
-                if (set->bindings[b].samplers) vk_ps4_free(alloc, set->bindings[b].samplers);
-            }
+        if (!pDescriptorSets[i]) continue;
+        VkPs4DescriptorSet *set = (VkPs4DescriptorSet *)pDescriptorSets[i];
+        /* Free binding resource arrays */
+        for (uint32_t b = 0; b < set->binding_count; b++) {
+            if (set->bindings[b].buffers) vk_ps4_free(alloc, set->bindings[b].buffers);
+            if (set->bindings[b].textures) vk_ps4_free(alloc, set->bindings[b].textures);
+            if (set->bindings[b].samplers) vk_ps4_free(alloc, set->bindings[b].samplers);
+        }
+        /* Add to the pool's free list for reuse, or free if pool is full */
+        if (pool && pool->free_count < VK_PS4_MAX_POOLED_SETS) {
+            pool->free_list[pool->free_count++] = set;
+        } else {
             vk_ps4_free(alloc, set);
         }
+        if (pool) pool->sets_freed++;
     }
     return VK_SUCCESS;
 }
@@ -1063,9 +1143,22 @@ vk_ps4_FreeDescriptorSets(VkDevice device, VkDescriptorPool descriptorPool,
 
 VKAPI_ATTR VkResult VKAPI_CALL
 vk_ps4_ResetDescriptorPool(VkDevice device, VkDescriptorPool descriptorPool, VkDescriptorPoolResetFlags flags) {
-    (void)device;
-    (void)descriptorPool;
     (void)flags;
+    if (!device || !descriptorPool) return VK_ERROR_INITIALIZATION_FAILED;
+    VkPs4Device *dev = (VkPs4Device *)device;
+    const VkAllocationCallbacks *alloc = &dev->allocator;
+    VkPs4DescriptorPool *pool = (VkPs4DescriptorPool *)descriptorPool;
+
+    /* Free all descriptor sets in the free list */
+    for (uint32_t i = 0; i < pool->free_count; i++) {
+        if (pool->free_list[i]) {
+            vk_ps4_free(alloc, pool->free_list[i]);
+            pool->free_list[i] = NULL;
+        }
+    }
+    pool->free_count = 0;
+    pool->sets_allocated = 0;
+    pool->sets_freed = 0;
     return VK_SUCCESS;
 }
 

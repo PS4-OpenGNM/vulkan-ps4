@@ -2224,6 +2224,189 @@ int main(int argc, char **argv) {
         }
     }
 
+    /* === Phase 5 Performance Tests === */
+
+    /* 17a. Pipeline cache — create, get data size, get data, create from data */
+    {
+        VkPipelineCache cache = VK_NULL_HANDLE;
+        VkPipelineCacheCreateInfo pcci = {0};
+        pcci.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO;
+        vr = vkCreatePipelineCache(dev, &pcci, NULL, &cache);
+        if (vr == VK_SUCCESS) {
+            /* Get data size */
+            size_t data_size = 0;
+            vr = vkGetPipelineCacheData(dev, cache, &data_size, NULL);
+            if (vr == VK_SUCCESS && data_size >= 32) {
+                /* Get data */
+                void *data = malloc(data_size);
+                if (data) {
+                    vr = vkGetPipelineCacheData(dev, cache, &data_size, data);
+                    if (vr == VK_SUCCESS) {
+                        /* Verify header */
+                        uint32_t *hdr = (uint32_t *)data;
+                        if (hdr[0] >= 32 && hdr[1] == 1) {
+                            printf("Pipeline cache: header OK (size=%zu, vendor=0x%x, device=0x%x)\n",
+                                   data_size, hdr[2], hdr[3]);
+                        } else {
+                            fprintf(stderr, "Pipeline cache: bad header\n");
+                            vc.errors++;
+                        }
+                        /* Create a second cache from the data */
+                        VkPipelineCacheCreateInfo pcci2 = {0};
+                        pcci2.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO;
+                        pcci2.initialDataSize = data_size;
+                        pcci2.pInitialData = data;
+                        VkPipelineCache cache2 = VK_NULL_HANDLE;
+                        vr = vkCreatePipelineCache(dev, &pcci2, NULL, &cache2);
+                        if (vr == VK_SUCCESS) {
+                            printf("Pipeline cache: create from initial data OK\n");
+                            vkDestroyPipelineCache(dev, cache2, NULL);
+                        }
+                    }
+                    free(data);
+                }
+            } else {
+                fprintf(stderr, "Pipeline cache: get data size failed: %d\n", vr);
+                vc.errors++;
+            }
+            vkDestroyPipelineCache(dev, cache, NULL);
+        } else {
+            fprintf(stderr, "Pipeline cache: create failed: %d\n", vr);
+            vc.errors++;
+        }
+    }
+
+    /* 17b. Descriptor set pooling — alloc, free, re-alloc (should reuse) */
+    {
+        VkDescriptorPoolSize pool_sizes[] = {
+            {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 4},
+        };
+        VkDescriptorPoolCreateInfo dpci = {0};
+        dpci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+        dpci.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
+        dpci.maxSets = 4;
+        dpci.poolSizeCount = 1;
+        dpci.pPoolSizes = pool_sizes;
+        VkDescriptorPool pool = VK_NULL_HANDLE;
+        vr = vkCreateDescriptorPool(dev, &dpci, NULL, &pool);
+        if (vr == VK_SUCCESS) {
+            /* Simple layout with 1 UBO binding */
+            VkDescriptorSetLayoutBinding binding = {0};
+            binding.binding = 0;
+            binding.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+            binding.descriptorCount = 1;
+            binding.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+            VkDescriptorSetLayoutCreateInfo dlci = {0};
+            dlci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+            dlci.bindingCount = 1;
+            dlci.pBindings = &binding;
+            VkDescriptorSetLayout dsl = VK_NULL_HANDLE;
+            vr = vkCreateDescriptorSetLayout(dev, &dlci, NULL, &dsl);
+            if (vr == VK_SUCCESS) {
+                VkDescriptorSetLayout layouts[2] = {dsl, dsl};
+                VkDescriptorSet sets[2] = {0};
+                VkDescriptorSetAllocateInfo dsai = {0};
+                dsai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+                dsai.descriptorPool = pool;
+                dsai.descriptorSetCount = 2;
+                dsai.pSetLayouts = layouts;
+                vr = vkAllocateDescriptorSets(dev, &dsai, sets);
+                if (vr == VK_SUCCESS) {
+                    printf("Descriptor set pooling: allocated 2 sets OK\n");
+                    /* Free them */
+                    vr = vkFreeDescriptorSets(dev, pool, 2, sets);
+                    if (vr == VK_SUCCESS) {
+                        printf("Descriptor set pooling: freed 2 sets OK\n");
+                        /* Re-allocate — should reuse from free list */
+                        VkDescriptorSet sets2[2] = {0};
+                        vr = vkAllocateDescriptorSets(dev, &dsai, sets2);
+                        if (vr == VK_SUCCESS) {
+                            printf("Descriptor set pooling: re-allocated 2 sets OK\n");
+                            /* Free for cleanup */
+                            vkFreeDescriptorSets(dev, pool, 2, sets2);
+                        } else {
+                            fprintf(stderr, "Descriptor set pooling: re-alloc failed: %d\n", vr);
+                            vc.errors++;
+                        }
+                    } else {
+                        fprintf(stderr, "Descriptor set pooling: free failed: %d\n", vr);
+                        vc.errors++;
+                    }
+                } else {
+                    fprintf(stderr, "Descriptor set pooling: alloc failed: %d\n", vr);
+                    vc.errors++;
+                }
+                vkDestroyDescriptorSetLayout(dev, dsl, NULL);
+            }
+            vkDestroyDescriptorPool(dev, pool, NULL);
+        } else {
+            fprintf(stderr, "Descriptor set pooling: create pool failed: %d\n", vr);
+            vc.errors++;
+        }
+    }
+
+    /* 17c. Command buffer pooling — alloc, free, re-alloc (should reuse) */
+    {
+        VkCommandPoolCreateInfo cpci = {0};
+        cpci.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+        cpci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+        cpci.queueFamilyIndex = 0;
+        VkCommandPool pool = VK_NULL_HANDLE;
+        vr = vkCreateCommandPool(dev, &cpci, NULL, &pool);
+        if (vr == VK_SUCCESS) {
+            VkCommandBufferAllocateInfo cbai = {0};
+            cbai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+            cbai.commandPool = pool;
+            cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+            cbai.commandBufferCount = 2;
+            VkCommandBuffer cmds[2] = {0};
+            vr = vkAllocateCommandBuffers(dev, &cbai, cmds);
+            if (vr == VK_SUCCESS) {
+                printf("Command buffer pooling: allocated 2 buffers OK\n");
+                vkFreeCommandBuffers(dev, pool, 2, cmds);
+                printf("Command buffer pooling: freed 2 buffers OK\n");
+                /* Re-allocate — should reuse from free list */
+                VkCommandBuffer cmds2[2] = {0};
+                vr = vkAllocateCommandBuffers(dev, &cbai, cmds2);
+                if (vr == VK_SUCCESS) {
+                    printf("Command buffer pooling: re-allocated 2 buffers OK\n");
+                    vkFreeCommandBuffers(dev, pool, 2, cmds2);
+                } else {
+                    fprintf(stderr, "Command buffer pooling: re-alloc failed: %d\n", vr);
+                    vc.errors++;
+                }
+            } else {
+                fprintf(stderr, "Command buffer pooling: alloc failed: %d\n", vr);
+                vc.errors++;
+            }
+            vkDestroyCommandPool(dev, pool, NULL);
+        } else {
+            fprintf(stderr, "Command buffer pooling: create pool failed: %d\n", vr);
+            vc.errors++;
+        }
+    }
+
+    /* 17d. Pipeline cache merge — create two caches, merge */
+    {
+        VkPipelineCacheCreateInfo pcci = {0};
+        pcci.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO;
+        VkPipelineCache c1 = VK_NULL_HANDLE, c2 = VK_NULL_HANDLE;
+        vkCreatePipelineCache(dev, &pcci, NULL, &c1);
+        vkCreatePipelineCache(dev, &pcci, NULL, &c2);
+        if (c1 && c2) {
+            VkPipelineCache src[1] = {c2};
+            vr = vkMergePipelineCaches(dev, c1, 1, src);
+            if (vr == VK_SUCCESS) {
+                printf("Pipeline cache merge: OK\n");
+            } else {
+                fprintf(stderr, "Pipeline cache merge: failed: %d\n", vr);
+                vc.errors++;
+            }
+            vkDestroyPipelineCache(dev, c1, NULL);
+            vkDestroyPipelineCache(dev, c2, NULL);
+        }
+    }
+
     /* Deferred resource cleanup — must happen after the command
      * buffer has finished executing, not while it's still recording. */
     /* Push constant resources */

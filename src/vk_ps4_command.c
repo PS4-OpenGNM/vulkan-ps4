@@ -763,6 +763,18 @@ vk_ps4_DestroyCommandPool(VkDevice device, VkCommandPool commandPool, const VkAl
         }
     }
     pool->command_buffer_count = 0;
+
+    /* Free all command buffers in the free list */
+    for (uint32_t i = 0; i < pool->free_count; i++) {
+        if (pool->free_list[i]) {
+            if (pool->free_list[i]->pm4_buffer)
+                vk_ps4_free(alloc, pool->free_list[i]->pm4_buffer);
+            vk_ps4_free(alloc, pool->free_list[i]);
+            pool->free_list[i] = NULL;
+        }
+    }
+    pool->free_count = 0;
+
     vk_ps4_free(alloc, pool);
 }
 
@@ -777,19 +789,33 @@ vk_ps4_AllocateCommandBuffers(VkDevice device, const VkCommandBufferAllocateInfo
     VkPs4CommandPool *pool = (VkPs4CommandPool *)pAllocateInfo->commandPool;
 
     for (uint32_t i = 0; i < pAllocateInfo->commandBufferCount; i++) {
-        VkPs4CommandBuffer *cmd = vk_ps4_alloc_zero(alloc, sizeof(*cmd), 16);
-        if (!cmd) {
-            /* Per Vulkan spec: on failure, all pCommandBuffers must be VK_NULL_HANDLE */
-            for (uint32_t j = 0; j < i; j++) {
-                VkPs4CommandBuffer *c = (VkPs4CommandBuffer *)pCommandBuffers[j];
-                if (c) {
-                    if (c->pm4_buffer) vk_ps4_free(alloc, c->pm4_buffer);
-                    vk_ps4_free(alloc, c);
-                }
-                pCommandBuffers[j] = VK_NULL_HANDLE;
-            }
-            return VK_ERROR_OUT_OF_HOST_MEMORY;
+        VkPs4CommandBuffer *cmd = NULL;
+
+        /* Try to reuse from the pool's free list first */
+        if (pool && pool->free_count > 0) {
+            cmd = pool->free_list[--pool->free_count];
+            pool->free_list[pool->free_count] = NULL;
+            /* Reset the command buffer state for reuse */
+            memset(cmd, 0, offsetof(VkPs4CommandBuffer, gnm_cmd));
+            cmd->pm4_used = 0;
         }
+
+        if (!cmd) {
+            cmd = vk_ps4_alloc_zero(alloc, sizeof(*cmd), 16);
+            if (!cmd) {
+                for (uint32_t j = 0; j < i; j++) {
+                    VkPs4CommandBuffer *c = (VkPs4CommandBuffer *)pCommandBuffers[j];
+                    if (c) {
+                        if (c->pm4_buffer) vk_ps4_free(alloc, c->pm4_buffer);
+                        vk_ps4_free(alloc, c);
+                    }
+                    pCommandBuffers[j] = VK_NULL_HANDLE;
+                }
+                return VK_ERROR_OUT_OF_HOST_MEMORY;
+            }
+            cmd->pm4_buffer = NULL;
+        }
+
         cmd->type = VK_PS4_OBJ_COMMAND_BUFFER;
         cmd->device = dev;
         cmd->pool = pool;
@@ -799,20 +825,25 @@ vk_ps4_AllocateCommandBuffers(VkDevice device, const VkCommandBufferAllocateInfo
         cmd->current_pipeline = NULL;
         cmd->vertex_binding_count = 0;
 
-        /* Allocate PM4 buffer */
-        cmd->pm4_buffer_size = VK_PS4_CMD_BUFFER_SIZE / sizeof(uint32_t);
-        cmd->pm4_buffer = vk_ps4_alloc_zero(alloc, cmd->pm4_buffer_size * sizeof(uint32_t), 256);
+        /* Allocate PM4 buffer if not reused */
         if (!cmd->pm4_buffer) {
-            vk_ps4_free(alloc, cmd);
-            for (uint32_t j = 0; j < i; j++) {
-                VkPs4CommandBuffer *c = (VkPs4CommandBuffer *)pCommandBuffers[j];
-                if (c) {
-                    if (c->pm4_buffer) vk_ps4_free(alloc, c->pm4_buffer);
-                    vk_ps4_free(alloc, c);
+            cmd->pm4_buffer_size = VK_PS4_CMD_BUFFER_SIZE / sizeof(uint32_t);
+            cmd->pm4_buffer = vk_ps4_alloc_zero(alloc, cmd->pm4_buffer_size * sizeof(uint32_t), 256);
+            if (!cmd->pm4_buffer) {
+                vk_ps4_free(alloc, cmd);
+                for (uint32_t j = 0; j < i; j++) {
+                    VkPs4CommandBuffer *c = (VkPs4CommandBuffer *)pCommandBuffers[j];
+                    if (c) {
+                        if (c->pm4_buffer) vk_ps4_free(alloc, c->pm4_buffer);
+                        vk_ps4_free(alloc, c);
+                    }
+                    pCommandBuffers[j] = VK_NULL_HANDLE;
                 }
-                pCommandBuffers[j] = VK_NULL_HANDLE;
+                return VK_ERROR_OUT_OF_HOST_MEMORY;
             }
-            return VK_ERROR_OUT_OF_HOST_MEMORY;
+        } else {
+            /* Reused buffer — clear the PM4 contents */
+            memset(cmd->pm4_buffer, 0, cmd->pm4_buffer_size * sizeof(uint32_t));
         }
         cmd->pm4_used = 0;
 
@@ -821,14 +852,11 @@ vk_ps4_AllocateCommandBuffers(VkDevice device, const VkCommandBufferAllocateInfo
             if (pool->command_buffer_count < VK_PS4_MAX_COMMAND_BUFFERS_PER_POOL) {
                 pool->command_buffers[pool->command_buffer_count++] = cmd;
             } else {
-                /* Pool full — free this command buffer and fail.
-                 * Null all previously-allocated handles in this call. */
                 vk_ps4_free(alloc, cmd->pm4_buffer);
                 vk_ps4_free(alloc, cmd);
                 for (uint32_t j = 0; j < i; j++) {
                     VkPs4CommandBuffer *c = (VkPs4CommandBuffer *)pCommandBuffers[j];
                     if (c) {
-                        /* Remove from pool to avoid double-free in DestroyCommandPool */
                         for (uint32_t k = 0; k < pool->command_buffer_count; k++) {
                             if (pool->command_buffers[k] == c) {
                                 pool->command_buffers[k] = NULL;
@@ -877,8 +905,13 @@ vk_ps4_FreeCommandBuffers(VkDevice device, VkCommandPool commandPool,
             }
         }
 
-        if (cmd->pm4_buffer) vk_ps4_free(alloc, cmd->pm4_buffer);
-        vk_ps4_free(alloc, cmd);
+        /* Add to the pool's free list for reuse, or free if pool is full */
+        if (pool && pool->free_count < VK_PS4_MAX_COMMAND_BUFFERS_PER_POOL) {
+            pool->free_list[pool->free_count++] = cmd;
+        } else {
+            if (cmd->pm4_buffer) vk_ps4_free(alloc, cmd->pm4_buffer);
+            vk_ps4_free(alloc, cmd);
+        }
     }
 }
 
@@ -956,17 +989,43 @@ vk_ps4_ResetCommandBuffer(VkCommandBuffer commandBuffer, VkCommandBufferResetFla
 
 VKAPI_ATTR VkResult VKAPI_CALL
 vk_ps4_ResetCommandPool(VkDevice device, VkCommandPool commandPool, VkCommandPoolResetFlags flags) {
-    (void)device;
-    (void)commandPool;
     (void)flags;
+    if (!device || !commandPool) return VK_ERROR_INITIALIZATION_FAILED;
+    VkPs4Device *dev = (VkPs4Device *)device;
+    const VkAllocationCallbacks *alloc = &dev->allocator;
+    VkPs4CommandPool *pool = (VkPs4CommandPool *)commandPool;
+
+    /* Free all command buffers in the free list */
+    for (uint32_t i = 0; i < pool->free_count; i++) {
+        if (pool->free_list[i]) {
+            if (pool->free_list[i]->pm4_buffer)
+                vk_ps4_free(alloc, pool->free_list[i]->pm4_buffer);
+            vk_ps4_free(alloc, pool->free_list[i]);
+            pool->free_list[i] = NULL;
+        }
+    }
+    pool->free_count = 0;
     return VK_SUCCESS;
 }
 
 VKAPI_ATTR void VKAPI_CALL
 vk_ps4_TrimCommandPool(VkDevice device, VkCommandPool commandPool, VkCommandPoolTrimFlags flags) {
-    (void)device;
-    (void)commandPool;
     (void)flags;
+    if (!device || !commandPool) return;
+    VkPs4Device *dev = (VkPs4Device *)device;
+    const VkAllocationCallbacks *alloc = &dev->allocator;
+    VkPs4CommandPool *pool = (VkPs4CommandPool *)commandPool;
+
+    /* Free all command buffers in the free list — they're not in use */
+    for (uint32_t i = 0; i < pool->free_count; i++) {
+        if (pool->free_list[i]) {
+            if (pool->free_list[i]->pm4_buffer)
+                vk_ps4_free(alloc, pool->free_list[i]->pm4_buffer);
+            vk_ps4_free(alloc, pool->free_list[i]);
+            pool->free_list[i] = NULL;
+        }
+    }
+    pool->free_count = 0;
 }
 
 /* === Command buffer recording === */
@@ -1417,27 +1476,44 @@ vk_ps4_CmdDraw(VkCommandBuffer commandBuffer, uint32_t vertexCount, uint32_t ins
      * gl_InstanceIndex respectively.
      * GCN user-data registers are sticky (persist across draws), so
      * we must always write them when the pipeline uses them — even
-     * when the value is 0 — to avoid stale state from a previous draw. */
+     * when the value is 0 — to avoid stale state from a previous draw.
+     * Optimization: if both registers are consecutive, emit a single
+     * SET_SH_REG packet with count=2 instead of two separate packets. */
     if (cmd->current_pipeline) {
         VkPs4Pipeline *pipe = cmd->current_pipeline;
-        if (pipe->has_base_vertex_reg) {
+        bool both = pipe->has_base_vertex_reg && pipe->has_start_instance_reg &&
+                    pipe->vs_base_vertex_reg + 1 == pipe->vs_start_instance_reg;
+        if (both) {
+            /* Batched: single SET_SH_REG with 2 values */
             uint32_t reg_addr = R_00B130_SPI_SHADER_USER_DATA_VS_0 +
                                 pipe->vs_base_vertex_reg * 4;
-            if ((uint32_t)(cmd->gnm_cmd.endptr - cmd->gnm_cmd.cmdptr) >= 3) {
-                cmd->gnm_cmd.cmdptr[0] = PKT3(PKT3_SET_SH_REG, 1, 0);
+            if ((uint32_t)(cmd->gnm_cmd.endptr - cmd->gnm_cmd.cmdptr) >= 4) {
+                cmd->gnm_cmd.cmdptr[0] = PKT3(PKT3_SET_SH_REG, 2, 0);
                 cmd->gnm_cmd.cmdptr[1] = (reg_addr - SI_SH_REG_OFFSET) >> 2;
                 cmd->gnm_cmd.cmdptr[2] = firstVertex;
-                cmd->gnm_cmd.cmdptr += 3;
+                cmd->gnm_cmd.cmdptr[3] = firstInstance;
+                cmd->gnm_cmd.cmdptr += 4;
             }
-        }
-        if (pipe->has_start_instance_reg) {
-            uint32_t reg_addr = R_00B130_SPI_SHADER_USER_DATA_VS_0 +
-                                pipe->vs_start_instance_reg * 4;
-            if ((uint32_t)(cmd->gnm_cmd.endptr - cmd->gnm_cmd.cmdptr) >= 3) {
-                cmd->gnm_cmd.cmdptr[0] = PKT3(PKT3_SET_SH_REG, 1, 0);
-                cmd->gnm_cmd.cmdptr[1] = (reg_addr - SI_SH_REG_OFFSET) >> 2;
-                cmd->gnm_cmd.cmdptr[2] = firstInstance;
-                cmd->gnm_cmd.cmdptr += 3;
+        } else {
+            if (pipe->has_base_vertex_reg) {
+                uint32_t reg_addr = R_00B130_SPI_SHADER_USER_DATA_VS_0 +
+                                    pipe->vs_base_vertex_reg * 4;
+                if ((uint32_t)(cmd->gnm_cmd.endptr - cmd->gnm_cmd.cmdptr) >= 3) {
+                    cmd->gnm_cmd.cmdptr[0] = PKT3(PKT3_SET_SH_REG, 1, 0);
+                    cmd->gnm_cmd.cmdptr[1] = (reg_addr - SI_SH_REG_OFFSET) >> 2;
+                    cmd->gnm_cmd.cmdptr[2] = firstVertex;
+                    cmd->gnm_cmd.cmdptr += 3;
+                }
+            }
+            if (pipe->has_start_instance_reg) {
+                uint32_t reg_addr = R_00B130_SPI_SHADER_USER_DATA_VS_0 +
+                                    pipe->vs_start_instance_reg * 4;
+                if ((uint32_t)(cmd->gnm_cmd.endptr - cmd->gnm_cmd.cmdptr) >= 3) {
+                    cmd->gnm_cmd.cmdptr[0] = PKT3(PKT3_SET_SH_REG, 1, 0);
+                    cmd->gnm_cmd.cmdptr[1] = (reg_addr - SI_SH_REG_OFFSET) >> 2;
+                    cmd->gnm_cmd.cmdptr[2] = firstInstance;
+                    cmd->gnm_cmd.cmdptr += 3;
+                }
             }
         }
     }
@@ -1473,27 +1549,43 @@ vk_ps4_CmdDrawIndexed(VkCommandBuffer commandBuffer, uint32_t indexCount, uint32
      * written before the draw packet. They are also sticky (persist
      * across draws), so we must always write them when the pipeline
      * uses them — even when the value is 0 — to avoid stale state
-     * from a previous draw. */
+     * from a previous draw.
+     * Optimization: if both registers are consecutive, emit a single
+     * SET_SH_REG packet with count=2 instead of two separate packets. */
     if (cmd->current_pipeline) {
         VkPs4Pipeline *pipe = cmd->current_pipeline;
-        if (pipe->has_base_vertex_reg) {
+        bool both = pipe->has_base_vertex_reg && pipe->has_start_instance_reg &&
+                    pipe->vs_base_vertex_reg + 1 == pipe->vs_start_instance_reg;
+        if (both) {
             uint32_t reg_addr = R_00B130_SPI_SHADER_USER_DATA_VS_0 +
                                 pipe->vs_base_vertex_reg * 4;
-            if ((uint32_t)(cmd->gnm_cmd.endptr - cmd->gnm_cmd.cmdptr) >= 3) {
-                cmd->gnm_cmd.cmdptr[0] = PKT3(PKT3_SET_SH_REG, 1, 0);
+            if ((uint32_t)(cmd->gnm_cmd.endptr - cmd->gnm_cmd.cmdptr) >= 4) {
+                cmd->gnm_cmd.cmdptr[0] = PKT3(PKT3_SET_SH_REG, 2, 0);
                 cmd->gnm_cmd.cmdptr[1] = (reg_addr - SI_SH_REG_OFFSET) >> 2;
                 cmd->gnm_cmd.cmdptr[2] = (uint32_t)vertexOffset;
-                cmd->gnm_cmd.cmdptr += 3;
+                cmd->gnm_cmd.cmdptr[3] = firstInstance;
+                cmd->gnm_cmd.cmdptr += 4;
             }
-        }
-        if (pipe->has_start_instance_reg) {
-            uint32_t reg_addr = R_00B130_SPI_SHADER_USER_DATA_VS_0 +
-                                pipe->vs_start_instance_reg * 4;
-            if ((uint32_t)(cmd->gnm_cmd.endptr - cmd->gnm_cmd.cmdptr) >= 3) {
-                cmd->gnm_cmd.cmdptr[0] = PKT3(PKT3_SET_SH_REG, 1, 0);
-                cmd->gnm_cmd.cmdptr[1] = (reg_addr - SI_SH_REG_OFFSET) >> 2;
-                cmd->gnm_cmd.cmdptr[2] = firstInstance;
-                cmd->gnm_cmd.cmdptr += 3;
+        } else {
+            if (pipe->has_base_vertex_reg) {
+                uint32_t reg_addr = R_00B130_SPI_SHADER_USER_DATA_VS_0 +
+                                    pipe->vs_base_vertex_reg * 4;
+                if ((uint32_t)(cmd->gnm_cmd.endptr - cmd->gnm_cmd.cmdptr) >= 3) {
+                    cmd->gnm_cmd.cmdptr[0] = PKT3(PKT3_SET_SH_REG, 1, 0);
+                    cmd->gnm_cmd.cmdptr[1] = (reg_addr - SI_SH_REG_OFFSET) >> 2;
+                    cmd->gnm_cmd.cmdptr[2] = (uint32_t)vertexOffset;
+                    cmd->gnm_cmd.cmdptr += 3;
+                }
+            }
+            if (pipe->has_start_instance_reg) {
+                uint32_t reg_addr = R_00B130_SPI_SHADER_USER_DATA_VS_0 +
+                                    pipe->vs_start_instance_reg * 4;
+                if ((uint32_t)(cmd->gnm_cmd.endptr - cmd->gnm_cmd.cmdptr) >= 3) {
+                    cmd->gnm_cmd.cmdptr[0] = PKT3(PKT3_SET_SH_REG, 1, 0);
+                    cmd->gnm_cmd.cmdptr[1] = (reg_addr - SI_SH_REG_OFFSET) >> 2;
+                    cmd->gnm_cmd.cmdptr[2] = firstInstance;
+                    cmd->gnm_cmd.cmdptr += 3;
+                }
             }
         }
     }
@@ -2812,69 +2904,105 @@ vk_ps4_CmdPushConstants(VkCommandBuffer commandBuffer, VkPipelineLayout layout,
      * raw uint32_t values to the shader's user-data registers.
      * The pipeline's push_const_slots table (populated from
      * IMM_ALUFLOATCONST input usage slots) maps each push constant
-     * dword index to a user-data register. */
+     * dword index to a user-data register.
+     * Optimization: consecutive user-data registers are batched into
+     * a single SET_SH_REG packet to reduce PM4 overhead. */
     const uint32_t *values = (const uint32_t *)pValues;
     uint32_t start_dword = offset / 4;
     uint32_t end_dword = (offset + size + 3) / 4;
 
-    /* Helper to emit a single SET_SH_REG packet for one user-data reg. */
-    #define EMIT_PUSH_CONST_DWORD(gnm_cmd, reg_base, reg_idx, value, is_cs) do { \
-        uint32_t _addr = (reg_base) + (reg_idx) * 4; \
-        if ((uint32_t)((gnm_cmd)->endptr - (gnm_cmd)->cmdptr) < 3) { \
-            if ((gnm_cmd)->callback.func) \
-                (gnm_cmd)->callback.func(gnm_cmd, 3, (gnm_cmd)->callback.userdata); \
-            if ((uint32_t)((gnm_cmd)->endptr - (gnm_cmd)->cmdptr) < 3) break; \
+    /* Helper to emit a batched SET_SH_REG packet for consecutive regs.
+     * Collects values into a small stack buffer, then emits one packet. */
+    #define EMIT_PUSH_CONST_BATCH(gnm_cmd, reg_base, is_cs, slots, nslots) do { \
+        uint32_t _buf[VK_PS4_MAX_PUSH_CONST_DWORDS]; \
+        uint32_t _n = 0; \
+        uint32_t _first_reg = 0; \
+        for (uint32_t _i = 0; _i < (nslots); _i++) { \
+            uint32_t _dw = (slots)[_i].dword_index; \
+            if (_dw < start_dword || _dw >= end_dword) { \
+                if (_n > 0) { \
+                    uint32_t _need = 2 + _n; \
+                    if ((uint32_t)((gnm_cmd)->endptr - (gnm_cmd)->cmdptr) < _need) { \
+                        if ((gnm_cmd)->callback.func) \
+                            (gnm_cmd)->callback.func(gnm_cmd, _need, (gnm_cmd)->callback.userdata); \
+                    } \
+                    if ((uint32_t)((gnm_cmd)->endptr - (gnm_cmd)->cmdptr) >= _need) { \
+                        (gnm_cmd)->cmdptr[0] = PKT3(PKT3_SET_SH_REG, _n, 0) | \
+                            ((is_cs) ? PKT3_SHADER_TYPE_S(1) : 0); \
+                        (gnm_cmd)->cmdptr[1] = ((reg_base) + _first_reg * 4 - SI_SH_REG_OFFSET) >> 2; \
+                        for (uint32_t _j = 0; _j < _n; _j++) \
+                            (gnm_cmd)->cmdptr[2 + _j] = _buf[_j]; \
+                        (gnm_cmd)->cmdptr += 2 + _n; \
+                    } \
+                    _n = 0; \
+                } \
+                continue; \
+            } \
+            uint32_t _reg = (slots)[_i].user_data_reg; \
+            uint32_t _val = values[_dw - start_dword]; \
+            if (_n == 0) { \
+                _first_reg = _reg; \
+                _buf[_n++] = _val; \
+            } else if (_reg == _first_reg + _n) { \
+                _buf[_n++] = _val; \
+            } else { \
+                uint32_t _need = 2 + _n; \
+                if ((uint32_t)((gnm_cmd)->endptr - (gnm_cmd)->cmdptr) < _need) { \
+                    if ((gnm_cmd)->callback.func) \
+                        (gnm_cmd)->callback.func(gnm_cmd, _need, (gnm_cmd)->callback.userdata); \
+                } \
+                if ((uint32_t)((gnm_cmd)->endptr - (gnm_cmd)->cmdptr) >= _need) { \
+                    (gnm_cmd)->cmdptr[0] = PKT3(PKT3_SET_SH_REG, _n, 0) | \
+                        ((is_cs) ? PKT3_SHADER_TYPE_S(1) : 0); \
+                    (gnm_cmd)->cmdptr[1] = ((reg_base) + _first_reg * 4 - SI_SH_REG_OFFSET) >> 2; \
+                    for (uint32_t _j = 0; _j < _n; _j++) \
+                        (gnm_cmd)->cmdptr[2 + _j] = _buf[_j]; \
+                    (gnm_cmd)->cmdptr += 2 + _n; \
+                } \
+                _first_reg = _reg; \
+                _n = 0; \
+                _buf[_n++] = _val; \
+            } \
         } \
-        (gnm_cmd)->cmdptr[0] = PKT3(PKT3_SET_SH_REG, 1, 0) | \
-            ((is_cs) ? PKT3_SHADER_TYPE_S(1) : 0); \
-        (gnm_cmd)->cmdptr[1] = (_addr - SI_SH_REG_OFFSET) >> 2; \
-        (gnm_cmd)->cmdptr[2] = (value); \
-        (gnm_cmd)->cmdptr += 3; \
+        if (_n > 0) { \
+            uint32_t _need = 2 + _n; \
+            if ((uint32_t)((gnm_cmd)->endptr - (gnm_cmd)->cmdptr) < _need) { \
+                if ((gnm_cmd)->callback.func) \
+                    (gnm_cmd)->callback.func(gnm_cmd, _need, (gnm_cmd)->callback.userdata); \
+            } \
+            if ((uint32_t)((gnm_cmd)->endptr - (gnm_cmd)->cmdptr) >= _need) { \
+                (gnm_cmd)->cmdptr[0] = PKT3(PKT3_SET_SH_REG, _n, 0) | \
+                    ((is_cs) ? PKT3_SHADER_TYPE_S(1) : 0); \
+                (gnm_cmd)->cmdptr[1] = ((reg_base) + _first_reg * 4 - SI_SH_REG_OFFSET) >> 2; \
+                for (uint32_t _j = 0; _j < _n; _j++) \
+                    (gnm_cmd)->cmdptr[2 + _j] = _buf[_j]; \
+                (gnm_cmd)->cmdptr += 2 + _n; \
+            } \
+        } \
     } while (0)
 
     /* VS push constants */
     if ((stageFlags & VK_SHADER_STAGE_VERTEX_BIT) && pipe->vs_push_const_slot_count > 0) {
-        for (uint32_t i = 0; i < pipe->vs_push_const_slot_count; i++) {
-            uint32_t dw_idx = pipe->vs_push_const_slots[i].dword_index;
-            if (dw_idx >= start_dword && dw_idx < end_dword) {
-                uint32_t val = values[dw_idx - start_dword];
-                EMIT_PUSH_CONST_DWORD(&cmd->gnm_cmd,
-                    R_00B130_SPI_SHADER_USER_DATA_VS_0,
-                    pipe->vs_push_const_slots[i].user_data_reg,
-                    val, false);
-            }
-        }
+        EMIT_PUSH_CONST_BATCH(&cmd->gnm_cmd,
+            R_00B130_SPI_SHADER_USER_DATA_VS_0, false,
+            pipe->vs_push_const_slots, pipe->vs_push_const_slot_count);
     }
 
     /* PS push constants */
     if ((stageFlags & VK_SHADER_STAGE_FRAGMENT_BIT) && pipe->ps_push_const_slot_count > 0) {
-        for (uint32_t i = 0; i < pipe->ps_push_const_slot_count; i++) {
-            uint32_t dw_idx = pipe->ps_push_const_slots[i].dword_index;
-            if (dw_idx >= start_dword && dw_idx < end_dword) {
-                uint32_t val = values[dw_idx - start_dword];
-                EMIT_PUSH_CONST_DWORD(&cmd->gnm_cmd,
-                    R_00B030_SPI_SHADER_USER_DATA_PS_0,
-                    pipe->ps_push_const_slots[i].user_data_reg,
-                    val, false);
-            }
-        }
+        EMIT_PUSH_CONST_BATCH(&cmd->gnm_cmd,
+            R_00B030_SPI_SHADER_USER_DATA_PS_0, false,
+            pipe->ps_push_const_slots, pipe->ps_push_const_slot_count);
     }
 
     /* CS push constants */
     if ((stageFlags & VK_SHADER_STAGE_COMPUTE_BIT) && pipe->cs_push_const_slot_count > 0) {
-        for (uint32_t i = 0; i < pipe->cs_push_const_slot_count; i++) {
-            uint32_t dw_idx = pipe->cs_push_const_slots[i].dword_index;
-            if (dw_idx >= start_dword && dw_idx < end_dword) {
-                uint32_t val = values[dw_idx - start_dword];
-                EMIT_PUSH_CONST_DWORD(&cmd->gnm_cmd,
-                    R_00B900_COMPUTE_USER_DATA_0,
-                    pipe->cs_push_const_slots[i].user_data_reg,
-                    val, true);
-            }
-        }
+        EMIT_PUSH_CONST_BATCH(&cmd->gnm_cmd,
+            R_00B900_COMPUTE_USER_DATA_0, true,
+            pipe->cs_push_const_slots, pipe->cs_push_const_slot_count);
     }
 
-    #undef EMIT_PUSH_CONST_DWORD
+    #undef EMIT_PUSH_CONST_BATCH
     (void)layout;
 }
 

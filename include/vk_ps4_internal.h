@@ -81,6 +81,7 @@ enum VkPs4ObjectType {
     VK_PS4_OBJ_EVENT,
     VK_PS4_OBJ_QUERY_POOL,
     VK_PS4_OBJ_SWAPCHAIN_KHR,
+    VK_PS4_OBJ_PIPELINE_CACHE,
 };
 typedef enum VkPs4ObjectType VkPs4ObjectType;
 
@@ -109,6 +110,7 @@ typedef struct VkPs4Semaphore VkPs4Semaphore;
 typedef struct VkPs4Event VkPs4Event;
 typedef struct VkPs4QueryPool VkPs4QueryPool;
 typedef struct VkPs4Swapchain VkPs4Swapchain;
+typedef struct VkPs4PipelineCache VkPs4PipelineCache;
 
 /* === Instance === */
 struct VkPs4Instance {
@@ -184,6 +186,12 @@ struct VkPs4CommandPool {
     /* Track allocated command buffers for cleanup on DestroyCommandPool */
     VkPs4CommandBuffer *command_buffers[VK_PS4_MAX_COMMAND_BUFFERS_PER_POOL];
     uint32_t command_buffer_count;
+    /* Free list for command buffer reuse — reduces allocation overhead.
+     * When FreeCommandBuffers is called, freed command buffers are kept
+     * here instead of being returned to the allocator.  AllocateCommandBuffers
+     * reuses them from this list first. */
+    VkPs4CommandBuffer *free_list[VK_PS4_MAX_COMMAND_BUFFERS_PER_POOL];
+    uint32_t free_count;
 };
 
 struct VkPs4CommandBuffer {
@@ -348,6 +356,39 @@ struct VkPs4ShaderModule {
     bool has_metadata;
 };
 
+/* === Pipeline cache ===
+ * The pipeline cache stores compiled shader binaries keyed by a hash
+ * of the SPIR-V code + stage.  This allows:
+ * 1. Fast pipeline creation when the same shader is used again
+ * 2. Persistence via GetPipelineCacheData / CreatePipelineCache(initialData)
+ *
+ * Cache format (after the 32-byte Vulkan header):
+ *   uint32_t entry_count
+ *   For each entry:
+ *     uint64_t hash          (SPIR-V hash + stage)
+ *     uint32_t stage         (VkShaderStageFlagBits)
+ *     uint32_t spirv_size    (SPIR-V code size for verification)
+ *     uint32_t binary_size   (compiled GCN binary size)
+ *     uint8_t  spirv_hash[16] (SHA-1 truncated to 16 bytes of SPIR-V)
+ *     void     binary_data[binary_size]
+ */
+#define VK_PS4_PIPELINE_CACHE_MAX_ENTRIES 256
+typedef struct {
+    uint64_t hash;          /* hash of stage + spirv code */
+    uint32_t stage;         /* VkShaderStageFlagBits */
+    uint32_t spirv_size;    /* original SPIR-V size */
+    uint32_t binary_size;   /* compiled binary size */
+    void *binary;           /* compiled GCN shader binary */
+} VkPs4PipelineCacheEntry;
+
+struct VkPs4PipelineCache {
+    VkPs4ObjectType type;
+    VkPs4Device *device;
+    VkAllocationCallbacks allocator;
+    VkPs4PipelineCacheEntry entries[VK_PS4_PIPELINE_CACHE_MAX_ENTRIES];
+    uint32_t entry_count;
+};
+
 /* === Pipeline layout / descriptor set layout === */
 struct VkPs4DescriptorSetLayout {
     VkPs4ObjectType type;
@@ -501,6 +542,16 @@ struct VkPs4DescriptorPool {
     VkPs4ObjectType type;
     VkPs4Device *device;
     VkDescriptorPoolCreateInfo create_info;
+    /* Pool tracking: count allocated vs max, and a free list for reuse.
+     * When VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT is set,
+     * freed sets are kept in the free list for reuse instead of being
+     * returned to the allocator.  This reduces allocation overhead for
+     * apps that frequently allocate/free descriptor sets. */
+    uint32_t sets_allocated;
+    uint32_t sets_freed;
+#define VK_PS4_MAX_POOLED_SETS 256
+    VkPs4DescriptorSet *free_list[VK_PS4_MAX_POOLED_SETS];
+    uint32_t free_count;
 };
 
 struct VkPs4DescriptorSet {
@@ -698,6 +749,15 @@ VKAPI_ATTR VkResult VKAPI_CALL vk_ps4_CreatePipelineCache(VkDevice, const VkPipe
 VKAPI_ATTR void VKAPI_CALL vk_ps4_DestroyPipelineCache(VkDevice, VkPipelineCache, const VkAllocationCallbacks *);
 VKAPI_ATTR VkResult VKAPI_CALL vk_ps4_GetPipelineCacheData(VkDevice, VkPipelineCache, size_t *, void *);
 VKAPI_ATTR VkResult VKAPI_CALL vk_ps4_MergePipelineCaches(VkDevice, VkPipelineCache, uint32_t, const VkPipelineCache *);
+
+/* Pipeline cache helpers — used by pipeline creation to skip recompilation */
+void *vk_ps4_pipeline_cache_lookup(VkPipelineCache cache, uint64_t hash,
+                                    uint32_t stage, size_t *out_size);
+VkResult vk_ps4_pipeline_cache_insert(VkPipelineCache cache, uint64_t hash,
+                                       uint32_t stage, uint32_t spirv_size,
+                                       const void *binary, size_t binary_size);
+uint64_t vk_ps4_pipeline_cache_hash(const void *spirv, size_t spirv_size,
+                                     uint32_t stage);
 
 /* Descriptor */
 VKAPI_ATTR VkResult VKAPI_CALL vk_ps4_CreateDescriptorSetLayout(VkDevice, const VkDescriptorSetLayoutCreateInfo *, const VkAllocationCallbacks *, VkDescriptorSetLayout *);

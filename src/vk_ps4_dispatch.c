@@ -256,24 +256,110 @@ vk_ps4_GetPhysicalDeviceQueueFamilyProperties2(VkPhysicalDevice physicalDevice,
     }
 }
 
-/* Pipeline cache — minimal implementation.
- * The pipeline cache is an opaque object that stores compiled shader
- * binaries. For now, we implement it as a simple header-only cache
- * with no actual data. This is valid — the Vulkan spec allows empty
- * pipeline caches. */
-typedef struct {
-    uint32_t reserved;  /* opaque handle — no data stored yet */
-} VkPs4PipelineCache;
+/* Pipeline cache — stores compiled shader binaries for reuse.
+ * See VkPs4PipelineCache in vk_ps4_internal.h for the data format. */
+
+/* FNV-1a 64-bit hash — fast, good distribution for SPIR-V code */
+uint64_t vk_ps4_pipeline_cache_hash(const void *spirv, size_t spirv_size,
+                                     uint32_t stage) {
+    const uint8_t *data = (const uint8_t *)spirv;
+    uint64_t hash = 1469598103934665603ULL;  /* FNV offset basis */
+    hash ^= (uint64_t)stage;
+    hash *= 1099511628211ULL;  /* FNV prime */
+    for (size_t i = 0; i < spirv_size; i++) {
+        hash ^= data[i];
+        hash *= 1099511628211ULL;
+    }
+    return hash;
+}
+
+void *vk_ps4_pipeline_cache_lookup(VkPipelineCache cache, uint64_t hash,
+                                    uint32_t stage, size_t *out_size) {
+    if (!cache) return NULL;
+    VkPs4PipelineCache *pc = (VkPs4PipelineCache *)cache;
+    for (uint32_t i = 0; i < pc->entry_count; i++) {
+        if (pc->entries[i].hash == hash && pc->entries[i].stage == stage) {
+            if (out_size) *out_size = pc->entries[i].binary_size;
+            return pc->entries[i].binary;
+        }
+    }
+    return NULL;
+}
+
+VkResult vk_ps4_pipeline_cache_insert(VkPipelineCache cache, uint64_t hash,
+                                       uint32_t stage, uint32_t spirv_size,
+                                       const void *binary, size_t binary_size) {
+    if (!cache) return VK_SUCCESS;
+    VkPs4PipelineCache *pc = (VkPs4PipelineCache *)cache;
+    if (pc->entry_count >= VK_PS4_PIPELINE_CACHE_MAX_ENTRIES) return VK_SUCCESS;
+    /* Check for duplicate */
+    for (uint32_t i = 0; i < pc->entry_count; i++) {
+        if (pc->entries[i].hash == hash && pc->entries[i].stage == stage)
+            return VK_SUCCESS;
+    }
+    /* Insert — copy the binary so the caller can free their copy */
+    void *binary_copy = vk_ps4_alloc(&pc->allocator, binary_size, 16);
+    if (!binary_copy) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    memcpy(binary_copy, binary, binary_size);
+    pc->entries[pc->entry_count].hash = hash;
+    pc->entries[pc->entry_count].stage = stage;
+    pc->entries[pc->entry_count].spirv_size = spirv_size;
+    pc->entries[pc->entry_count].binary_size = (uint32_t)binary_size;
+    pc->entries[pc->entry_count].binary = binary_copy;
+    pc->entry_count++;
+    return VK_SUCCESS;
+}
 
 VKAPI_ATTR VkResult VKAPI_CALL
 vk_ps4_CreatePipelineCache(VkDevice device, const VkPipelineCacheCreateInfo *pCreateInfo,
                             const VkAllocationCallbacks *pAllocator, VkPipelineCache *pPipelineCache) {
-    (void)device; (void)pCreateInfo;
-    if (!pPipelineCache) return VK_ERROR_INITIALIZATION_FAILED;
-    VkPs4PipelineCache *cache = (VkPs4PipelineCache *)vk_ps4_alloc(
-        pAllocator, sizeof(VkPs4PipelineCache), 8);
+    if (!device || !pPipelineCache) return VK_ERROR_INITIALIZATION_FAILED;
+    VkPs4Device *dev = (VkPs4Device *)device;
+    const VkAllocationCallbacks *alloc = pAllocator ? pAllocator : &dev->allocator;
+
+    VkPs4PipelineCache *cache = (VkPs4PipelineCache *)vk_ps4_alloc_zero(
+        alloc, sizeof(VkPs4PipelineCache), 8);
     if (!cache) return VK_ERROR_OUT_OF_HOST_MEMORY;
-    cache->reserved = 0;
+    cache->type = VK_PS4_OBJ_PIPELINE_CACHE;
+    cache->device = dev;
+    cache->allocator = *alloc;
+    cache->entry_count = 0;
+
+    /* Load initial data if provided */
+    if (pCreateInfo && pCreateInfo->initialDataSize > 0 && pCreateInfo->pInitialData) {
+        const uint8_t *data = (const uint8_t *)pCreateInfo->pInitialData;
+        size_t data_size = pCreateInfo->initialDataSize;
+        /* Skip the 32-byte Vulkan header */
+        const size_t header_size = 16 + VK_UUID_SIZE;
+        if (data_size > header_size + 4) {
+            const uint8_t *payload = data + header_size;
+            size_t payload_size = data_size - header_size;
+            uint32_t entry_count = *(const uint32_t *)payload;
+            payload += 4;
+            payload_size -= 4;
+            for (uint32_t i = 0; i < entry_count && payload_size >= 24; i++) {
+                uint64_t hash = *(const uint64_t *)payload; payload += 8; payload_size -= 8;
+                uint32_t stage = *(const uint32_t *)payload; payload += 4; payload_size -= 4;
+                uint32_t spirv_sz = *(const uint32_t *)payload; payload += 4; payload_size -= 4;
+                uint32_t bin_sz = *(const uint32_t *)payload; payload += 4; payload_size -= 4;
+                (void)spirv_sz;
+                if (bin_sz > payload_size || cache->entry_count >= VK_PS4_PIPELINE_CACHE_MAX_ENTRIES)
+                    break;
+                void *binary_copy = vk_ps4_alloc(alloc, bin_sz, 16);
+                if (!binary_copy) break;
+                memcpy(binary_copy, payload, bin_sz);
+                cache->entries[cache->entry_count].hash = hash;
+                cache->entries[cache->entry_count].stage = stage;
+                cache->entries[cache->entry_count].spirv_size = spirv_sz;
+                cache->entries[cache->entry_count].binary_size = bin_sz;
+                cache->entries[cache->entry_count].binary = binary_copy;
+                cache->entry_count++;
+                payload += bin_sz;
+                payload_size -= bin_sz;
+            }
+        }
+    }
+
     *pPipelineCache = (VkPipelineCache)cache;
     return VK_SUCCESS;
 }
@@ -283,7 +369,11 @@ vk_ps4_DestroyPipelineCache(VkDevice device, VkPipelineCache pipelineCache,
                              const VkAllocationCallbacks *pAllocator) {
     (void)device;
     if (!pipelineCache) return;
-    vk_ps4_free(pAllocator, (void *)pipelineCache);
+    VkPs4PipelineCache *cache = (VkPs4PipelineCache *)pipelineCache;
+    const VkAllocationCallbacks *alloc = pAllocator ? pAllocator : &cache->allocator;
+    for (uint32_t i = 0; i < cache->entry_count; i++)
+        vk_ps4_free(alloc, cache->entries[i].binary);
+    vk_ps4_free(alloc, cache);
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL
@@ -295,6 +385,8 @@ vk_ps4_GetPipelineCacheData(VkDevice device, VkPipelineCache pipelineCache,
         *pDataSize = 0;
         return VK_ERROR_INITIALIZATION_FAILED;
     }
+    VkPs4PipelineCache *cache = (VkPs4PipelineCache *)pipelineCache;
+
     /* Vulkan pipeline cache header (VK_PIPELINE_CACHE_HEADER_VERSION_ONE):
      *   offset  0: uint32_t headerSize  (= 32)
      *   offset  4: uint32_t headerVersion (= 1)
@@ -303,14 +395,23 @@ vk_ps4_GetPipelineCacheData(VkDevice device, VkPipelineCache pipelineCache,
      *   offset 16: uint8_t  pipelineCacheUUID[16] (all zeros for now)
      * Total: 32 bytes (16 + VK_UUID_SIZE) */
     const size_t header_size = 16 + VK_UUID_SIZE;  /* 32 */
+
+    /* Payload: entry_count + entries */
+    size_t payload_size = 4;  /* entry_count */
+    for (uint32_t i = 0; i < cache->entry_count; i++)
+        payload_size += 24 + cache->entries[i].binary_size;  /* 8+4+4+4+4 + binary */
+
+    size_t total_size = header_size + payload_size;
+
     if (!pData) {
-        *pDataSize = header_size;
+        *pDataSize = total_size;
         return VK_SUCCESS;
     }
-    if (*pDataSize < header_size) {
-        *pDataSize = header_size;
+    if (*pDataSize < total_size) {
+        *pDataSize = total_size;
         return VK_INCOMPLETE;
     }
+
     /* Write the Vulkan pipeline cache header */
     uint32_t *out = (uint32_t *)pData;
     out[0] = (uint32_t)header_size;                /* headerSize */
@@ -319,15 +420,56 @@ vk_ps4_GetPipelineCacheData(VkDevice device, VkPipelineCache pipelineCache,
     out[3] = 0x9920;                               /* deviceID (PS4 Liverpool) */
     /* pipelineCacheUUID: 16 bytes of zeros */
     memset(&out[4], 0, VK_UUID_SIZE);
-    *pDataSize = header_size;
+
+    /* Write payload */
+    uint8_t *payload = (uint8_t *)pData + header_size;
+    *(uint32_t *)payload = cache->entry_count;
+    payload += 4;
+    for (uint32_t i = 0; i < cache->entry_count; i++) {
+        *(uint64_t *)payload = cache->entries[i].hash; payload += 8;
+        *(uint32_t *)payload = cache->entries[i].stage; payload += 4;
+        *(uint32_t *)payload = cache->entries[i].spirv_size; payload += 4;
+        *(uint32_t *)payload = cache->entries[i].binary_size; payload += 4;
+        memcpy(payload, cache->entries[i].binary, cache->entries[i].binary_size);
+        payload += cache->entries[i].binary_size;
+    }
+
+    *pDataSize = total_size;
     return VK_SUCCESS;
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL
 vk_ps4_MergePipelineCaches(VkDevice device, VkPipelineCache dstCache,
                             uint32_t srcCacheCount, const VkPipelineCache *pSrcCaches) {
-    (void)device; (void)dstCache; (void)srcCacheCount; (void)pSrcCaches;
-    /* No-op: our cache stores nothing, so merging is trivially successful. */
+    (void)device;
+    if (!dstCache) return VK_ERROR_INITIALIZATION_FAILED;
+    VkPs4PipelineCache *dst = (VkPs4PipelineCache *)dstCache;
+
+    for (uint32_t s = 0; s < srcCacheCount; s++) {
+        if (!pSrcCaches[s]) continue;
+        VkPs4PipelineCache *src = (VkPs4PipelineCache *)pSrcCaches[s];
+        for (uint32_t i = 0; i < src->entry_count; i++) {
+            if (dst->entry_count >= VK_PS4_PIPELINE_CACHE_MAX_ENTRIES) break;
+            /* Check for duplicate */
+            bool found = false;
+            for (uint32_t j = 0; j < dst->entry_count; j++) {
+                if (dst->entries[j].hash == src->entries[i].hash &&
+                    dst->entries[j].stage == src->entries[i].stage) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                void *binary_copy = vk_ps4_alloc(&dst->allocator,
+                    src->entries[i].binary_size, 16);
+                if (!binary_copy) return VK_ERROR_OUT_OF_HOST_MEMORY;
+                memcpy(binary_copy, src->entries[i].binary, src->entries[i].binary_size);
+                dst->entries[dst->entry_count] = src->entries[i];
+                dst->entries[dst->entry_count].binary = binary_copy;
+                dst->entry_count++;
+            }
+        }
+    }
     return VK_SUCCESS;
 }
 
