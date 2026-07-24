@@ -560,6 +560,20 @@ static const VkPs4NameEntry g_cmd_funcs[] = {
     ENTRY(vkGetSemaphoreCounterValueKHR),
     ENTRY(vkSignalSemaphoreKHR),
     ENTRY(vkWaitSemaphoresKHR),
+    /* VK_KHR_create_renderpass2 */
+    ENTRY(vkCreateRenderPass2),
+    ENTRY(vkCreateRenderPass2KHR),
+    ENTRY(vkCmdBeginRenderPass2),
+    ENTRY(vkCmdBeginRenderPass2KHR),
+    ENTRY(vkCmdNextSubpass2),
+    ENTRY(vkCmdNextSubpass2KHR),
+    ENTRY(vkCmdEndRenderPass2),
+    ENTRY(vkCmdEndRenderPass2KHR),
+    /* VK_EXT_host_query_reset */
+    ENTRY(vkResetQueryPoolEXT),
+    /* VK_KHR_buffer_device_address */
+    ENTRY(vkGetBufferDeviceAddress),
+    ENTRY(vkGetBufferDeviceAddressKHR),
 };
 
 /* === vkGetInstanceProcAddr === */

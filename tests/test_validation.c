@@ -84,6 +84,8 @@ counting_callback(VkDebugUtilsMessageSeverityFlagBitsEXT severity,
 /* === Main === */
 
 int main(int argc, char **argv) {
+    setvbuf(stdout, NULL, _IONBF, 0);
+    setvbuf(stderr, NULL, _IONBF, 0);
     printf("=== vulkan-ps4 Validation Layer Test (expanded) ===\n\n");
 
     ValidationCounters vc = {0, 0};
@@ -178,13 +180,60 @@ int main(int argc, char **argv) {
         VK_KHR_IMAGELESS_FRAMEBUFFER_EXTENSION_NAME,
         VK_EXT_DESCRIPTOR_INDEXING_EXTENSION_NAME,
         VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME,
+        VK_KHR_CREATE_RENDERPASS_2_EXTENSION_NAME,
+        VK_KHR_DEPTH_STENCIL_RESOLVE_EXTENSION_NAME,
+        VK_EXT_SCALAR_BLOCK_LAYOUT_EXTENSION_NAME,
+        VK_KHR_UNIFORM_BUFFER_STANDARD_LAYOUT_EXTENSION_NAME,
+        VK_EXT_HOST_QUERY_RESET_EXTENSION_NAME,
+        VK_KHR_SHADER_ATOMIC_INT64_EXTENSION_NAME,
+        VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME,
+        VK_KHR_SHADER_SUBGROUP_EXTENDED_TYPES_EXTENSION_NAME,
+        VK_KHR_VULKAN_MEMORY_MODEL_EXTENSION_NAME,
+        VK_EXT_SEPARATE_STENCIL_USAGE_EXTENSION_NAME,
+        VK_KHR_SPIRV_1_4_EXTENSION_NAME,
+        VK_KHR_SHADER_FLOAT_CONTROLS_EXTENSION_NAME,
     };
     dci.enabledExtensionCount = sizeof(dev_exts) / sizeof(dev_exts[0]);
     dci.ppEnabledExtensionNames = dev_exts;
 
     /* Enable features via pNext chain */
+    VkPhysicalDeviceScalarBlockLayoutFeatures sbl_feat = {0};
+    sbl_feat.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SCALAR_BLOCK_LAYOUT_FEATURES;
+    sbl_feat.scalarBlockLayout = VK_TRUE;
+
+    VkPhysicalDeviceUniformBufferStandardLayoutFeatures ubsl_feat = {0};
+    ubsl_feat.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_UNIFORM_BUFFER_STANDARD_LAYOUT_FEATURES;
+    ubsl_feat.pNext = &sbl_feat;
+    ubsl_feat.uniformBufferStandardLayout = VK_TRUE;
+
+    VkPhysicalDeviceHostQueryResetFeatures hqr_feat = {0};
+    hqr_feat.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_QUERY_RESET_FEATURES;
+    hqr_feat.pNext = &ubsl_feat;
+    hqr_feat.hostQueryReset = VK_TRUE;
+
+    VkPhysicalDeviceShaderAtomicInt64Features ai_feat = {0};
+    ai_feat.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_INT64_FEATURES;
+    ai_feat.pNext = &hqr_feat;
+    ai_feat.shaderBufferInt64Atomics = VK_TRUE;
+
+    VkPhysicalDeviceBufferDeviceAddressFeatures bda_feat = {0};
+    bda_feat.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES;
+    bda_feat.pNext = &ai_feat;
+    bda_feat.bufferDeviceAddress = VK_TRUE;
+
+    VkPhysicalDeviceShaderSubgroupExtendedTypesFeatures sse_feat = {0};
+    sse_feat.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_SUBGROUP_EXTENDED_TYPES_FEATURES;
+    sse_feat.pNext = &bda_feat;
+    sse_feat.shaderSubgroupExtendedTypes = VK_TRUE;
+
+    VkPhysicalDeviceVulkanMemoryModelFeatures vmm_feat = {0};
+    vmm_feat.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_MEMORY_MODEL_FEATURES;
+    vmm_feat.pNext = &sse_feat;
+    vmm_feat.vulkanMemoryModel = VK_TRUE;
+
     VkPhysicalDeviceImagelessFramebufferFeatures imgless_feat = {0};
     imgless_feat.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGELESS_FRAMEBUFFER_FEATURES;
+    imgless_feat.pNext = &vmm_feat;
     imgless_feat.imagelessFramebuffer = VK_TRUE;
 
     VkPhysicalDeviceDescriptorIndexingFeatures desc_idx_feat = {0};
@@ -1920,6 +1969,257 @@ int main(int argc, char **argv) {
             vkDestroySemaphore(dev, tl_sem, NULL);
         } else {
             fprintf(stderr, "VK_KHR_timeline_semaphore: create failed: %d\n", vr);
+            vc.errors++;
+        }
+    }
+
+    /* 16e. VK_KHR_create_renderpass2 */
+    {
+        VkAttachmentDescription2 att2 = {0};
+        att2.sType = VK_STRUCTURE_TYPE_ATTACHMENT_DESCRIPTION_2;
+        att2.format = VK_FORMAT_R8G8B8A8_UNORM;
+        att2.samples = VK_SAMPLE_COUNT_1_BIT;
+        att2.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+        att2.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        att2.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        att2.finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+
+        VkAttachmentReference2 ref2 = {0};
+        ref2.sType = VK_STRUCTURE_TYPE_ATTACHMENT_REFERENCE_2;
+        ref2.attachment = 0;
+        ref2.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+
+        VkSubpassDescription2 sub2 = {0};
+        sub2.sType = VK_STRUCTURE_TYPE_SUBPASS_DESCRIPTION_2;
+        sub2.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+        sub2.colorAttachmentCount = 1;
+        sub2.pColorAttachments = &ref2;
+
+        VkRenderPassCreateInfo2 rp2ci = {0};
+        rp2ci.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO_2;
+        rp2ci.attachmentCount = 1;
+        rp2ci.pAttachments = &att2;
+        rp2ci.subpassCount = 1;
+        rp2ci.pSubpasses = &sub2;
+
+        VkRenderPass rp2 = VK_NULL_HANDLE;
+        PFN_vkCreateRenderPass2KHR vkCreateRenderPass2KHR =
+            (PFN_vkCreateRenderPass2KHR)vkGetDeviceProcAddr(dev, "vkCreateRenderPass2KHR");
+        if (vkCreateRenderPass2KHR) {
+            vr = vkCreateRenderPass2KHR(dev, &rp2ci, NULL, &rp2);
+            if (vr == VK_SUCCESS) {
+                printf("VK_KHR_create_renderpass2: render pass created OK\n");
+                vkDestroyRenderPass(dev, rp2, NULL);
+            } else {
+                fprintf(stderr, "VK_KHR_create_renderpass2: create failed: %d\n", vr);
+                vc.errors++;
+            }
+        } else {
+            fprintf(stderr, "VK_KHR_create_renderpass2: function not found\n");
+            vc.errors++;
+        }
+    }
+
+    /* 16f. VK_KHR_depth_stencil_resolve — properties query */
+    {
+        VkPhysicalDeviceDepthStencilResolveProperties ds_resolve_props = {0};
+        ds_resolve_props.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_STENCIL_RESOLVE_PROPERTIES;
+        VkPhysicalDeviceProperties2 props2 = {0};
+        props2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+        props2.pNext = &ds_resolve_props;
+        vkGetPhysicalDeviceProperties2(phys, &props2);
+        if (ds_resolve_props.supportedDepthResolveModes != 0) {
+            printf("VK_KHR_depth_stencil_resolve: depthResolveModes=0x%x OK\n",
+                   ds_resolve_props.supportedDepthResolveModes);
+        } else {
+            fprintf(stderr, "VK_KHR_depth_stencil_resolve: no resolve modes\n");
+            vc.errors++;
+        }
+    }
+
+    /* 16g. VK_EXT_scalar_block_layout — feature query */
+    {
+        VkPhysicalDeviceScalarBlockLayoutFeatures sbl_features = {0};
+        sbl_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SCALAR_BLOCK_LAYOUT_FEATURES;
+        VkPhysicalDeviceFeatures2 f2 = {0};
+        f2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+        f2.pNext = &sbl_features;
+        vkGetPhysicalDeviceFeatures2(phys, &f2);
+        if (sbl_features.scalarBlockLayout) {
+            printf("VK_EXT_scalar_block_layout: scalarBlockLayout=TRUE OK\n");
+        } else {
+            fprintf(stderr, "VK_EXT_scalar_block_layout: scalarBlockLayout=FALSE\n");
+            vc.errors++;
+        }
+    }
+
+    /* 16h. VK_EXT_host_query_reset — reset query pool on host */
+    {
+        VkPhysicalDeviceHostQueryResetFeatures hqr_features = {0};
+        hqr_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_QUERY_RESET_FEATURES;
+        VkPhysicalDeviceFeatures2 f2 = {0};
+        f2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+        f2.pNext = &hqr_features;
+        vkGetPhysicalDeviceFeatures2(phys, &f2);
+        if (hqr_features.hostQueryReset) {
+            /* Create a query pool and reset it on the host */
+            VkQueryPoolCreateInfo qpci = {0};
+            qpci.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+            qpci.queryType = VK_QUERY_TYPE_OCCLUSION;
+            qpci.queryCount = 4;
+            VkQueryPool pool = VK_NULL_HANDLE;
+            vr = vkCreateQueryPool(dev, &qpci, NULL, &pool);
+            if (vr == VK_SUCCESS) {
+                PFN_vkResetQueryPoolEXT vkResetQueryPool =
+                    (PFN_vkResetQueryPoolEXT)vkGetDeviceProcAddr(dev, "vkResetQueryPoolEXT");
+                if (vkResetQueryPool) {
+                    vkResetQueryPool(dev, pool, 0, 4);
+                    printf("VK_EXT_host_query_reset: reset query pool OK\n");
+                } else {
+                    fprintf(stderr, "VK_EXT_host_query_reset: function not found\n");
+                    vc.errors++;
+                }
+                vkDestroyQueryPool(dev, pool, NULL);
+            } else {
+                fprintf(stderr, "VK_EXT_host_query_reset: query pool create failed: %d\n", vr);
+                vc.errors++;
+            }
+        } else {
+            fprintf(stderr, "VK_EXT_host_query_reset: hostQueryReset=FALSE\n");
+            vc.errors++;
+        }
+    }
+
+    /* 16i. VK_KHR_buffer_device_address — get buffer address */
+    {
+        VkPhysicalDeviceBufferDeviceAddressFeatures bda_features = {0};
+        bda_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES;
+        VkPhysicalDeviceFeatures2 f2 = {0};
+        f2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+        f2.pNext = &bda_features;
+        vkGetPhysicalDeviceFeatures2(phys, &f2);
+        if (bda_features.bufferDeviceAddress) {
+            VkBufferCreateInfo bci = {0};
+            bci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+            bci.size = 256;
+            bci.usage = VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+            VkBuffer buf = VK_NULL_HANDLE;
+            vr = vkCreateBuffer(dev, &bci, NULL, &buf);
+            if (vr == VK_SUCCESS) {
+                VkMemoryRequirements mr = {0};
+                vkGetBufferMemoryRequirements(dev, buf, &mr);
+                /* Find memory type */
+                VkPhysicalDeviceMemoryProperties mp = {0};
+                vkGetPhysicalDeviceMemoryProperties(phys, &mp);
+                uint32_t mem_type = 0;
+                for (uint32_t i = 0; i < mp.memoryTypeCount; i++) {
+                    if ((mr.memoryTypeBits & (1u << i)) &&
+                        (mp.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) {
+                        mem_type = i;
+                        break;
+                    }
+                }
+                VkMemoryAllocateFlagsInfo mafi = {0};
+                mafi.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO;
+                mafi.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+
+                VkMemoryAllocateInfo mai = {0};
+                mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+                mai.pNext = &mafi;
+                mai.allocationSize = mr.size;
+                mai.memoryTypeIndex = mem_type;
+                VkDeviceMemory mem = VK_NULL_HANDLE;
+                vr = vkAllocateMemory(dev, &mai, NULL, &mem);
+                if (vr == VK_SUCCESS) {
+                    vkBindBufferMemory(dev, buf, mem, 0);
+                    PFN_vkGetBufferDeviceAddressKHR vkGetBDA =
+                        (PFN_vkGetBufferDeviceAddressKHR)vkGetDeviceProcAddr(dev, "vkGetBufferDeviceAddressKHR");
+                    if (vkGetBDA) {
+                        VkBufferDeviceAddressInfo bdai = {0};
+                        bdai.sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO;
+                        bdai.buffer = buf;
+                        VkDeviceAddress addr = vkGetBDA(dev, &bdai);
+                        if (addr != 0) {
+                            printf("VK_KHR_buffer_device_address: addr=0x%llx OK\n",
+                                   (unsigned long long)addr);
+                        } else {
+                            fprintf(stderr, "VK_KHR_buffer_device_address: addr=0\n");
+                            vc.errors++;
+                        }
+                    } else {
+                        fprintf(stderr, "VK_KHR_buffer_device_address: function not found\n");
+                        vc.errors++;
+                    }
+                    vkFreeMemory(dev, mem, NULL);
+                }
+                vkDestroyBuffer(dev, buf, NULL);
+            }
+        } else {
+            fprintf(stderr, "VK_KHR_buffer_device_address: bufferDeviceAddress=FALSE\n");
+            vc.errors++;
+        }
+    }
+
+    /* 16j. VK_KHR_vulkan_memory_model — feature query */
+    {
+        VkPhysicalDeviceVulkanMemoryModelFeatures vmm_features = {0};
+        vmm_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_MEMORY_MODEL_FEATURES;
+        VkPhysicalDeviceFeatures2 f2 = {0};
+        f2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+        f2.pNext = &vmm_features;
+        vkGetPhysicalDeviceFeatures2(phys, &f2);
+        if (vmm_features.vulkanMemoryModel) {
+            printf("VK_KHR_vulkan_memory_model: vulkanMemoryModel=TRUE OK\n");
+        } else {
+            fprintf(stderr, "VK_KHR_vulkan_memory_model: vulkanMemoryModel=FALSE\n");
+            vc.errors++;
+        }
+    }
+
+    /* 16k. VK_KHR_shader_atomic_int64 — feature query */
+    {
+        VkPhysicalDeviceShaderAtomicInt64Features ai_features = {0};
+        ai_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_INT64_FEATURES;
+        VkPhysicalDeviceFeatures2 f2 = {0};
+        f2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+        f2.pNext = &ai_features;
+        vkGetPhysicalDeviceFeatures2(phys, &f2);
+        if (ai_features.shaderBufferInt64Atomics) {
+            printf("VK_KHR_shader_atomic_int64: shaderBufferInt64Atomics=TRUE OK\n");
+        } else {
+            fprintf(stderr, "VK_KHR_shader_atomic_int64: shaderBufferInt64Atomics=FALSE\n");
+            vc.errors++;
+        }
+    }
+
+    /* 16l. VK_KHR_uniform_buffer_standard_layout — feature query */
+    {
+        VkPhysicalDeviceUniformBufferStandardLayoutFeatures ubsl_features = {0};
+        ubsl_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_UNIFORM_BUFFER_STANDARD_LAYOUT_FEATURES;
+        VkPhysicalDeviceFeatures2 f2 = {0};
+        f2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+        f2.pNext = &ubsl_features;
+        vkGetPhysicalDeviceFeatures2(phys, &f2);
+        if (ubsl_features.uniformBufferStandardLayout) {
+            printf("VK_KHR_uniform_buffer_standard_layout: uniformBufferStandardLayout=TRUE OK\n");
+        } else {
+            fprintf(stderr, "VK_KHR_uniform_buffer_standard_layout: uniformBufferStandardLayout=FALSE\n");
+            vc.errors++;
+        }
+    }
+
+    /* 16m. VK_KHR_shader_subgroup_extended_types — feature query */
+    {
+        VkPhysicalDeviceShaderSubgroupExtendedTypesFeatures sse_features = {0};
+        sse_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_SUBGROUP_EXTENDED_TYPES_FEATURES;
+        VkPhysicalDeviceFeatures2 f2 = {0};
+        f2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+        f2.pNext = &sse_features;
+        vkGetPhysicalDeviceFeatures2(phys, &f2);
+        if (sse_features.shaderSubgroupExtendedTypes) {
+            printf("VK_KHR_shader_subgroup_extended_types: shaderSubgroupExtendedTypes=TRUE OK\n");
+        } else {
+            fprintf(stderr, "VK_KHR_shader_subgroup_extended_types: shaderSubgroupExtendedTypes=FALSE\n");
             vc.errors++;
         }
     }

@@ -283,3 +283,23 @@ vk_ps4_CmdCopyQueryPoolResults(VkCommandBuffer commandBuffer, VkQueryPool queryP
         sceGnmDrawCmdCopyMemory(&cmd->gnm_cmd, dst_addr, src_addr, copy_size);
     }
 }
+
+/* === VK_EXT_host_query_reset === */
+
+VKAPI_ATTR void VKAPI_CALL
+vk_ps4_ResetQueryPoolEXT(VkDevice device, VkQueryPool queryPool,
+                         uint32_t firstQuery, uint32_t queryCount) {
+    (void)device;
+    if (!queryPool) return;
+    VkPs4QueryPool *pool = (VkPs4QueryPool *)queryPool;
+    /* Reset query results on the host by zeroing the result memory. */
+    if (pool->result_gpu_addr && pool->create_info.queryCount > 0) {
+        uint32_t end = firstQuery + queryCount;
+        if (end > pool->create_info.queryCount) end = pool->create_info.queryCount;
+        for (uint32_t i = firstQuery; i < end; i++) {
+            volatile uint64_t *slot =
+                (volatile uint64_t *)((char *)pool->result_buffer + i * QUERY_SLOT_SIZE);
+            *slot = 0;
+        }
+    }
+}

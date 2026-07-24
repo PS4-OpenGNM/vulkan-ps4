@@ -671,6 +671,7 @@ VKAPI_ATTR VkResult VKAPI_CALL vk_ps4_CreateImageView(VkDevice, const VkImageVie
 VKAPI_ATTR void VKAPI_CALL vk_ps4_DestroyImageView(VkDevice, VkImageView, const VkAllocationCallbacks *);
 VKAPI_ATTR VkResult VKAPI_CALL vk_ps4_CreateBufferView(VkDevice, const VkBufferViewCreateInfo *, const VkAllocationCallbacks *, VkBufferView *);
 VKAPI_ATTR void VKAPI_CALL vk_ps4_DestroyBufferView(VkDevice, VkBufferView, const VkAllocationCallbacks *);
+VKAPI_ATTR VkDeviceAddress VKAPI_CALL vk_ps4_GetBufferDeviceAddress(VkDevice, const VkBufferDeviceAddressInfo *);
 
 /* Misc */
 VKAPI_ATTR void VKAPI_CALL vk_ps4_GetRenderAreaGranularity(VkDevice, VkRenderPass, VkExtent2D *);
@@ -678,6 +679,7 @@ VKAPI_ATTR void VKAPI_CALL vk_ps4_GetDeviceMemoryCommitment(VkDevice, VkDeviceMe
 
 /* Render pass / framebuffer */
 VKAPI_ATTR VkResult VKAPI_CALL vk_ps4_CreateRenderPass(VkDevice, const VkRenderPassCreateInfo *, const VkAllocationCallbacks *, VkRenderPass *);
+VKAPI_ATTR VkResult VKAPI_CALL vk_ps4_CreateRenderPass2(VkDevice, const VkRenderPassCreateInfo2 *, const VkAllocationCallbacks *, VkRenderPass *);
 VKAPI_ATTR void VKAPI_CALL vk_ps4_DestroyRenderPass(VkDevice, VkRenderPass, const VkAllocationCallbacks *);
 VKAPI_ATTR VkResult VKAPI_CALL vk_ps4_CreateFramebuffer(VkDevice, const VkFramebufferCreateInfo *, const VkAllocationCallbacks *, VkFramebuffer *);
 VKAPI_ATTR void VKAPI_CALL vk_ps4_DestroyFramebuffer(VkDevice, VkFramebuffer, const VkAllocationCallbacks *);
@@ -788,6 +790,7 @@ VKAPI_ATTR VkResult VKAPI_CALL vk_ps4_CreateQueryPool(VkDevice, const VkQueryPoo
 VKAPI_ATTR void VKAPI_CALL vk_ps4_DestroyQueryPool(VkDevice, VkQueryPool, const VkAllocationCallbacks *);
 VKAPI_ATTR VkResult VKAPI_CALL vk_ps4_GetQueryPoolResults(VkDevice, VkQueryPool, uint32_t, uint32_t, size_t, void *, VkDeviceSize, VkQueryResultFlags);
 VKAPI_ATTR void VKAPI_CALL vk_ps4_CmdResetQueryPool(VkCommandBuffer, VkQueryPool, uint32_t, uint32_t);
+VKAPI_ATTR void VKAPI_CALL vk_ps4_ResetQueryPoolEXT(VkDevice, VkQueryPool, uint32_t, uint32_t);
 VKAPI_ATTR void VKAPI_CALL vk_ps4_CmdBeginQuery(VkCommandBuffer, VkQueryPool, uint32_t, VkQueryControlFlags);
 VKAPI_ATTR void VKAPI_CALL vk_ps4_CmdEndQuery(VkCommandBuffer, VkQueryPool, uint32_t);
 VKAPI_ATTR void VKAPI_CALL vk_ps4_CmdWriteTimestamp(VkCommandBuffer, VkPipelineStageFlagBits, VkQueryPool, uint32_t);

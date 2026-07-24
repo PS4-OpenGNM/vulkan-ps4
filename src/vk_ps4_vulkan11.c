@@ -223,6 +223,42 @@ vk_ps4_GetPhysicalDeviceProperties2(
             p->maxTimelineSemaphoreValueDifference = UINT64_MAX;
             break;
         }
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_STENCIL_RESOLVE_PROPERTIES: {
+            VkPhysicalDeviceDepthStencilResolveProperties *p =
+                (VkPhysicalDeviceDepthStencilResolveProperties *)chain;
+            p->sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_STENCIL_RESOLVE_PROPERTIES;
+            /* GCN supports depth/stencil resolve via HW.  Report supported modes. */
+            p->supportedDepthResolveModes = VK_RESOLVE_MODE_SAMPLE_ZERO_BIT;
+            p->supportedStencilResolveModes = VK_RESOLVE_MODE_SAMPLE_ZERO_BIT;
+            p->independentResolveNone = VK_TRUE;
+            p->independentResolve = VK_TRUE;
+            break;
+        }
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FLOAT_CONTROLS_PROPERTIES: {
+            VkPhysicalDeviceFloatControlsProperties *p =
+                (VkPhysicalDeviceFloatControlsProperties *)chain;
+            p->sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FLOAT_CONTROLS_PROPERTIES;
+            /* GCN 1.0: flush-to-zero for denorms, preserve signed zero/inf/nan
+             * for float32.  No float16/float64 on Liverpool. */
+            p->denormBehaviorIndependence = VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_ALL;
+            p->roundingModeIndependence = VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_NONE;
+            p->shaderSignedZeroInfNanPreserveFloat16 = VK_FALSE;
+            p->shaderSignedZeroInfNanPreserveFloat32 = VK_TRUE;
+            p->shaderSignedZeroInfNanPreserveFloat64 = VK_FALSE;
+            p->shaderDenormPreserveFloat16 = VK_FALSE;
+            p->shaderDenormPreserveFloat32 = VK_FALSE;
+            p->shaderDenormPreserveFloat64 = VK_FALSE;
+            p->shaderDenormFlushToZeroFloat16 = VK_FALSE;
+            p->shaderDenormFlushToZeroFloat32 = VK_TRUE;
+            p->shaderDenormFlushToZeroFloat64 = VK_FALSE;
+            p->shaderRoundingModeRTEFloat16 = VK_FALSE;
+            p->shaderRoundingModeRTEFloat32 = VK_FALSE;
+            p->shaderRoundingModeRTEFloat64 = VK_FALSE;
+            p->shaderRoundingModeRTZFloat16 = VK_FALSE;
+            p->shaderRoundingModeRTZFloat32 = VK_FALSE;
+            p->shaderRoundingModeRTZFloat64 = VK_FALSE;
+            break;
+        }
         default:
             /* Unrecognised — leave as-is (zeroed by caller). */
             break;
@@ -364,6 +400,71 @@ vk_ps4_GetPhysicalDeviceFeatures2(
             f->timelineSemaphore = VK_TRUE;
             break;
         }
+        /* Phase 4 batch: additional extension features */
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SCALAR_BLOCK_LAYOUT_FEATURES: {
+            VkPhysicalDeviceScalarBlockLayoutFeatures *f =
+                (VkPhysicalDeviceScalarBlockLayoutFeatures *)chain;
+            f->sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SCALAR_BLOCK_LAYOUT_FEATURES;
+            f->scalarBlockLayout = VK_TRUE;
+            break;
+        }
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_UNIFORM_BUFFER_STANDARD_LAYOUT_FEATURES: {
+            VkPhysicalDeviceUniformBufferStandardLayoutFeatures *f =
+                (VkPhysicalDeviceUniformBufferStandardLayoutFeatures *)chain;
+            f->sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_UNIFORM_BUFFER_STANDARD_LAYOUT_FEATURES;
+            f->uniformBufferStandardLayout = VK_TRUE;
+            break;
+        }
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_QUERY_RESET_FEATURES: {
+            VkPhysicalDeviceHostQueryResetFeatures *f =
+                (VkPhysicalDeviceHostQueryResetFeatures *)chain;
+            f->sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_QUERY_RESET_FEATURES;
+            f->hostQueryReset = VK_TRUE;
+            break;
+        }
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_INT64_FEATURES: {
+            VkPhysicalDeviceShaderAtomicInt64Features *f =
+                (VkPhysicalDeviceShaderAtomicInt64Features *)chain;
+            f->sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_INT64_FEATURES;
+            /* GCN 1.0 supports buffer atomics but not image atomics for int64.
+             * Report shaderBufferInt64Atomics as supported. */
+            f->shaderBufferInt64Atomics = VK_TRUE;
+            f->shaderSharedInt64Atomics = VK_FALSE;
+            break;
+        }
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES: {
+            VkPhysicalDeviceBufferDeviceAddressFeatures *f =
+                (VkPhysicalDeviceBufferDeviceAddressFeatures *)chain;
+            f->sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES;
+            /* GNM uses 64-bit GPU addresses natively. */
+            f->bufferDeviceAddress = VK_TRUE;
+            f->bufferDeviceAddressCaptureReplay = VK_FALSE;
+            f->bufferDeviceAddressMultiDevice = VK_FALSE;
+            break;
+        }
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_SUBGROUP_EXTENDED_TYPES_FEATURES: {
+            VkPhysicalDeviceShaderSubgroupExtendedTypesFeatures *f =
+                (VkPhysicalDeviceShaderSubgroupExtendedTypesFeatures *)chain;
+            f->sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_SUBGROUP_EXTENDED_TYPES_FEATURES;
+            /* GCN supports subgroup operations on basic types.  Extended types
+             * (8-bit, 16-bit, 64-bit) have partial support. */
+            f->shaderSubgroupExtendedTypes = VK_TRUE;
+            break;
+        }
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_MEMORY_MODEL_FEATURES: {
+            VkPhysicalDeviceVulkanMemoryModelFeatures *f =
+                (VkPhysicalDeviceVulkanMemoryModelFeatures *)chain;
+            f->sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_MEMORY_MODEL_FEATURES;
+            /* We honor memory model semantics via pipeline barriers. */
+            f->vulkanMemoryModel = VK_TRUE;
+            f->vulkanMemoryModelDeviceScope = VK_TRUE;
+            f->vulkanMemoryModelAvailabilityVisibilityChains = VK_FALSE;
+            break;
+        }
+        /* VK_KHR_spirv_1_4 has no features struct — it's just an extension
+         * that enables SPIR-V 1.4 support, handled by opengnm-psbc.
+         * VK_EXT_separate_stencil_usage also has no features struct — it
+         * only adds a VkImageCreateFlag (VK_IMAGE_CREATE_STENCIL_SAMPLED_BIT). */
         default:
             break;
         }

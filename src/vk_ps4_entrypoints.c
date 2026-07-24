@@ -133,6 +133,7 @@ VKAPI_ATTR VkResult VKAPI_CALL vkCreateQueryPool(VkDevice a, const VkQueryPoolCr
 VKAPI_ATTR void VKAPI_CALL vkDestroyQueryPool(VkDevice a, VkQueryPool b, const VkAllocationCallbacks *c) { vk_ps4_DestroyQueryPool(a, b, c); }
 VKAPI_ATTR VkResult VKAPI_CALL vkGetQueryPoolResults(VkDevice a, VkQueryPool b, uint32_t c, uint32_t d, size_t e, void *f, VkDeviceSize g, VkQueryResultFlags h) { return vk_ps4_GetQueryPoolResults(a, b, c, d, e, f, g, h); }
 VKAPI_ATTR void VKAPI_CALL vkCmdResetQueryPool(VkCommandBuffer a, VkQueryPool b, uint32_t c, uint32_t d) { vk_ps4_CmdResetQueryPool(a, b, c, d); }
+VKAPI_ATTR void VKAPI_CALL vkResetQueryPoolEXT(VkDevice a, VkQueryPool b, uint32_t c, uint32_t d) { vk_ps4_ResetQueryPoolEXT(a, b, c, d); }
 VKAPI_ATTR void VKAPI_CALL vkCmdBeginQuery(VkCommandBuffer a, VkQueryPool b, uint32_t c, VkQueryControlFlags d) { vk_ps4_CmdBeginQuery(a, b, c, d); }
 VKAPI_ATTR void VKAPI_CALL vkCmdEndQuery(VkCommandBuffer a, VkQueryPool b, uint32_t c) { vk_ps4_CmdEndQuery(a, b, c); }
 VKAPI_ATTR void VKAPI_CALL vkCmdWriteTimestamp(VkCommandBuffer a, VkPipelineStageFlagBits b, VkQueryPool c, uint32_t d) { vk_ps4_CmdWriteTimestamp(a, b, c, d); }
@@ -184,6 +185,8 @@ VKAPI_ATTR VkResult VKAPI_CALL vkGetPhysicalDeviceImageFormatProperties(VkPhysic
 /* Vulkan 1.1+ functions — not implemented, signatures differ from 1.0 */
 VKAPI_ATTR VkResult VKAPI_CALL vkCreateBufferView(VkDevice a, const VkBufferViewCreateInfo *b, const VkAllocationCallbacks *c, VkBufferView *d) { return vk_ps4_CreateBufferView(a, b, c, d); }
 VKAPI_ATTR void VKAPI_CALL vkDestroyBufferView(VkDevice a, VkBufferView b, const VkAllocationCallbacks *c) { vk_ps4_DestroyBufferView(a, b, c); }
+VKAPI_ATTR VkDeviceAddress VKAPI_CALL vkGetBufferDeviceAddress(VkDevice a, const VkBufferDeviceAddressInfo *b) { return vk_ps4_GetBufferDeviceAddress(a, b); }
+VKAPI_ATTR VkDeviceAddress VKAPI_CALL vkGetBufferDeviceAddressKHR(VkDevice a, const VkBufferDeviceAddressInfo *b) { return vk_ps4_GetBufferDeviceAddress(a, b); }
 VKAPI_ATTR VkResult VKAPI_CALL vkCreatePipelineCache(VkDevice a, const VkPipelineCacheCreateInfo *b, const VkAllocationCallbacks *c, VkPipelineCache *d) { return vk_ps4_CreatePipelineCache(a, b, c, d); }
 VKAPI_ATTR void VKAPI_CALL vkDestroyPipelineCache(VkDevice a, VkPipelineCache b, const VkAllocationCallbacks *c) { vk_ps4_DestroyPipelineCache(a, b, c); }
 VKAPI_ATTR VkResult VKAPI_CALL vkGetPipelineCacheData(VkDevice a, VkPipelineCache b, size_t *c, void *d) { return vk_ps4_GetPipelineCacheData(a, b, c, d); }
@@ -208,8 +211,13 @@ VKAPI_ATTR VkResult VKAPI_CALL vkSignalSemaphoreKHR(VkDevice a, const VkSemaphor
 VKAPI_ATTR VkResult VKAPI_CALL vkWaitSemaphoresKHR(VkDevice a, const VkSemaphoreWaitInfoKHR *b, uint64_t c) { return vk_ps4_WaitSemaphoresKHR(a, b, c); }
 /* Vulkan 1.2 render pass 2 variants */
 VKAPI_ATTR void VKAPI_CALL vkCmdBeginRenderPass2(VkCommandBuffer a, const VkRenderPassBeginInfo *b, const VkSubpassBeginInfo *c) { vk_ps4_CmdBeginRenderPass2(a, b, c); }
+VKAPI_ATTR void VKAPI_CALL vkCmdBeginRenderPass2KHR(VkCommandBuffer a, const VkRenderPassBeginInfo *b, const VkSubpassBeginInfo *c) { vk_ps4_CmdBeginRenderPass2(a, b, c); }
+VKAPI_ATTR VkResult VKAPI_CALL vkCreateRenderPass2(VkDevice a, const VkRenderPassCreateInfo2 *b, const VkAllocationCallbacks *c, VkRenderPass *d) { return vk_ps4_CreateRenderPass2(a, b, c, d); }
+VKAPI_ATTR VkResult VKAPI_CALL vkCreateRenderPass2KHR(VkDevice a, const VkRenderPassCreateInfo2 *b, const VkAllocationCallbacks *c, VkRenderPass *d) { return vk_ps4_CreateRenderPass2(a, b, c, d); }
 VKAPI_ATTR void VKAPI_CALL vkCmdNextSubpass2(VkCommandBuffer a, const VkSubpassBeginInfo *b, const VkSubpassEndInfo *c) { vk_ps4_CmdNextSubpass2(a, b, c); }
+VKAPI_ATTR void VKAPI_CALL vkCmdNextSubpass2KHR(VkCommandBuffer a, const VkSubpassBeginInfo *b, const VkSubpassEndInfo *c) { vk_ps4_CmdNextSubpass2(a, b, c); }
 VKAPI_ATTR void VKAPI_CALL vkCmdEndRenderPass2(VkCommandBuffer a, const VkSubpassEndInfo *b) { vk_ps4_CmdEndRenderPass2(a, b); }
+VKAPI_ATTR void VKAPI_CALL vkCmdEndRenderPass2KHR(VkCommandBuffer a, const VkSubpassEndInfo *b) { vk_ps4_CmdEndRenderPass2(a, b); }
 VKAPI_ATTR void VKAPI_CALL vkCmdWaitEvents(VkCommandBuffer a, uint32_t b, const VkEvent *c, VkPipelineStageFlags d, VkPipelineStageFlags e, uint32_t f, const VkMemoryBarrier *g, uint32_t h, const VkBufferMemoryBarrier *i, uint32_t j, const VkImageMemoryBarrier *k) { vk_ps4_CmdWaitEvents(a, b, c, d, e, f, g, h, i, j, k); }
 VKAPI_ATTR void VKAPI_CALL vkCmdResetEvent(VkCommandBuffer a, VkEvent b, VkPipelineStageFlags c) { vk_ps4_CmdResetEvent(a, b, c); }
 VKAPI_ATTR void VKAPI_CALL vkCmdSetEvent(VkCommandBuffer a, VkEvent b, VkPipelineStageFlags c) { vk_ps4_CmdSetEvent(a, b, c); }

@@ -269,3 +269,188 @@ vk_ps4_DestroyFramebuffer(VkDevice device, VkFramebuffer framebuffer, const VkAl
     vk_ps4_free(alloc, fb->attachments);
     vk_ps4_free(alloc, fb);
 }
+
+/* === VK_KHR_create_renderpass2 === */
+/* Convert VkRenderPassCreateInfo2 → VkRenderPassCreateInfo and delegate
+ * to the existing CreateRenderPass.  The v2 structures are supersets of
+ * v1 — we strip the extra fields (pNext, flags, aspectMask) and convert
+ * attachment refs to v1 format. */
+
+VKAPI_ATTR VkResult VKAPI_CALL
+vk_ps4_CreateRenderPass2(VkDevice device, const VkRenderPassCreateInfo2 *pCreateInfo,
+                         const VkAllocationCallbacks *pAllocator, VkRenderPass *pRenderPass) {
+    if (!device || !pCreateInfo || !pRenderPass) {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    VkPs4Device *dev = (VkPs4Device *)device;
+    const VkAllocationCallbacks *alloc = pAllocator ? pAllocator : &dev->allocator;
+
+    /* Convert attachments */
+    VkAttachmentDescription *atts = NULL;
+    if (pCreateInfo->attachmentCount > 0) {
+        atts = vk_ps4_alloc_zero(alloc,
+            pCreateInfo->attachmentCount * sizeof(VkAttachmentDescription), 16);
+        if (!atts) return VK_ERROR_OUT_OF_HOST_MEMORY;
+        for (uint32_t i = 0; i < pCreateInfo->attachmentCount; i++) {
+            const VkAttachmentDescription2 *s = &pCreateInfo->pAttachments[i];
+            atts[i].flags = s->flags;
+            atts[i].format = s->format;
+            atts[i].samples = s->samples;
+            atts[i].loadOp = s->loadOp;
+            atts[i].storeOp = s->storeOp;
+            atts[i].stencilLoadOp = s->stencilLoadOp;
+            atts[i].stencilStoreOp = s->stencilStoreOp;
+            atts[i].initialLayout = s->initialLayout;
+            atts[i].finalLayout = s->finalLayout;
+        }
+    }
+
+    /* Convert subpasses */
+    VkSubpassDescription *subs = NULL;
+    VkAttachmentReference **sub_refs = NULL;  /* arrays for each subpass */
+    uint32_t **sub_preserve = NULL;
+    /* We need to allocate arrays for input/color/resolve/ds refs per subpass.
+     * Use a simple approach: allocate all arrays up front. */
+    if (pCreateInfo->subpassCount > 0) {
+        subs = vk_ps4_alloc_zero(alloc,
+            pCreateInfo->subpassCount * sizeof(VkSubpassDescription), 16);
+        if (!subs) goto rp2_fail_atts;
+        /* Allocate per-subpass ref arrays */
+        sub_refs = vk_ps4_alloc_zero(alloc,
+            pCreateInfo->subpassCount * 4 * sizeof(VkAttachmentReference *), 16);
+        if (!sub_refs) goto rp2_fail_subs;
+        sub_preserve = vk_ps4_alloc_zero(alloc,
+            pCreateInfo->subpassCount * sizeof(uint32_t *), 16);
+        if (!sub_preserve) goto rp2_fail_subrefs;
+    }
+
+    for (uint32_t i = 0; i < pCreateInfo->subpassCount; i++) {
+        const VkSubpassDescription2 *s = &pCreateInfo->pSubpasses[i];
+        VkSubpassDescription *d = &subs[i];
+        d->flags = s->flags;
+        d->pipelineBindPoint = s->pipelineBindPoint;
+        d->inputAttachmentCount = s->inputAttachmentCount;
+        d->colorAttachmentCount = s->colorAttachmentCount;
+        d->preserveAttachmentCount = s->preserveAttachmentCount;
+
+        /* Input attachments */
+        if (s->inputAttachmentCount > 0 && s->pInputAttachments) {
+            VkAttachmentReference *refs = vk_ps4_alloc_zero(alloc,
+                s->inputAttachmentCount * sizeof(VkAttachmentReference), 16);
+            if (!refs) goto rp2_fail_all;
+            for (uint32_t j = 0; j < s->inputAttachmentCount; j++) {
+                refs[j].attachment = s->pInputAttachments[j].attachment;
+                refs[j].layout = s->pInputAttachments[j].layout;
+            }
+            d->pInputAttachments = refs;
+            sub_refs[i * 4 + 0] = refs;
+        }
+        /* Color attachments */
+        if (s->colorAttachmentCount > 0 && s->pColorAttachments) {
+            VkAttachmentReference *refs = vk_ps4_alloc_zero(alloc,
+                s->colorAttachmentCount * sizeof(VkAttachmentReference), 16);
+            if (!refs) goto rp2_fail_all;
+            for (uint32_t j = 0; j < s->colorAttachmentCount; j++) {
+                refs[j].attachment = s->pColorAttachments[j].attachment;
+                refs[j].layout = s->pColorAttachments[j].layout;
+            }
+            d->pColorAttachments = refs;
+            sub_refs[i * 4 + 1] = refs;
+        }
+        /* Resolve attachments */
+        if (s->colorAttachmentCount > 0 && s->pResolveAttachments) {
+            VkAttachmentReference *refs = vk_ps4_alloc_zero(alloc,
+                s->colorAttachmentCount * sizeof(VkAttachmentReference), 16);
+            if (!refs) goto rp2_fail_all;
+            for (uint32_t j = 0; j < s->colorAttachmentCount; j++) {
+                refs[j].attachment = s->pResolveAttachments[j].attachment;
+                refs[j].layout = s->pResolveAttachments[j].layout;
+            }
+            d->pResolveAttachments = refs;
+            sub_refs[i * 4 + 2] = refs;
+        }
+        /* Depth/stencil attachment */
+        if (s->pDepthStencilAttachment) {
+            VkAttachmentReference *ref = vk_ps4_alloc_zero(alloc,
+                sizeof(VkAttachmentReference), 16);
+            if (!ref) goto rp2_fail_all;
+            ref->attachment = s->pDepthStencilAttachment->attachment;
+            ref->layout = s->pDepthStencilAttachment->layout;
+            d->pDepthStencilAttachment = ref;
+            sub_refs[i * 4 + 3] = ref;
+        }
+        /* Preserve attachments */
+        if (s->preserveAttachmentCount > 0 && s->pPreserveAttachments) {
+            uint32_t *pres = vk_ps4_alloc_zero(alloc,
+                s->preserveAttachmentCount * sizeof(uint32_t), 16);
+            if (!pres) goto rp2_fail_all;
+            memcpy(pres, s->pPreserveAttachments,
+                   s->preserveAttachmentCount * sizeof(uint32_t));
+            d->pPreserveAttachments = pres;
+            sub_preserve[i] = pres;
+        }
+    }
+
+    /* Convert dependencies */
+    VkSubpassDependency *deps = NULL;
+    if (pCreateInfo->dependencyCount > 0 && pCreateInfo->pDependencies) {
+        deps = vk_ps4_alloc_zero(alloc,
+            pCreateInfo->dependencyCount * sizeof(VkSubpassDependency), 16);
+        if (!deps) goto rp2_fail_all;
+        for (uint32_t i = 0; i < pCreateInfo->dependencyCount; i++) {
+            const VkSubpassDependency2 *s = &pCreateInfo->pDependencies[i];
+            deps[i].srcSubpass = s->srcSubpass;
+            deps[i].dstSubpass = s->dstSubpass;
+            deps[i].srcStageMask = s->srcStageMask;
+            deps[i].dstStageMask = s->dstStageMask;
+            deps[i].srcAccessMask = s->srcAccessMask;
+            deps[i].dstAccessMask = s->dstAccessMask;
+            deps[i].dependencyFlags = s->dependencyFlags;
+        }
+    }
+
+    /* Build v1 create info and delegate */
+    VkRenderPassCreateInfo v1ci = {0};
+    v1ci.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+    v1ci.attachmentCount = pCreateInfo->attachmentCount;
+    v1ci.pAttachments = atts;
+    v1ci.subpassCount = pCreateInfo->subpassCount;
+    v1ci.pSubpasses = subs;
+    v1ci.dependencyCount = pCreateInfo->dependencyCount;
+    v1ci.pDependencies = deps;
+
+    VkResult result = vk_ps4_CreateRenderPass(device, &v1ci, pAllocator, pRenderPass);
+
+    /* Free conversion temporaries (CreateRenderPass deep-copies everything) */
+    vk_ps4_free(alloc, deps);
+    if (sub_refs) {
+        for (uint32_t i = 0; i < pCreateInfo->subpassCount; i++) {
+            for (uint32_t j = 0; j < 4; j++)
+                vk_ps4_free(alloc, sub_refs[i * 4 + j]);
+        }
+        vk_ps4_free(alloc, sub_refs);
+    }
+    if (sub_preserve) {
+        for (uint32_t i = 0; i < pCreateInfo->subpassCount; i++)
+            vk_ps4_free(alloc, sub_preserve[i]);
+        vk_ps4_free(alloc, sub_preserve);
+    }
+    vk_ps4_free(alloc, subs);
+    vk_ps4_free(alloc, atts);
+    return result;
+
+rp2_fail_all:
+    if (sub_refs) {
+        for (uint32_t i = 0; i < pCreateInfo->subpassCount; i++)
+            for (uint32_t j = 0; j < 4; j++)
+                vk_ps4_free(alloc, sub_refs[i * 4 + j]);
+        vk_ps4_free(alloc, sub_refs);
+    }
+rp2_fail_subrefs:
+    vk_ps4_free(alloc, sub_preserve);
+rp2_fail_subs:
+    vk_ps4_free(alloc, subs);
+rp2_fail_atts:
+    vk_ps4_free(alloc, atts);
+    return VK_ERROR_OUT_OF_HOST_MEMORY;
+}

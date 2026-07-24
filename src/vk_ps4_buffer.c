@@ -168,3 +168,15 @@ vk_ps4_DestroyBufferView(VkDevice device, VkBufferView bufferView, const VkAlloc
     const VkAllocationCallbacks *alloc = pAllocator ? pAllocator : &dev->allocator;
     vk_ps4_free(alloc, view);
 }
+
+/* === VK_KHR_buffer_device_address === */
+
+VKAPI_ATTR VkDeviceAddress VKAPI_CALL
+vk_ps4_GetBufferDeviceAddress(VkDevice device, const VkBufferDeviceAddressInfo *pInfo) {
+    (void)device;
+    if (!pInfo || !pInfo->buffer) return 0;
+    VkPs4Buffer *buf = (VkPs4Buffer *)pInfo->buffer;
+    if (!buf->memory) return 0;
+    /* GNM direct memory: directmemory is the GPU-visible address. */
+    return (VkDeviceAddress)(buf->memory->gnm_mem.directmemory + buf->memory_offset);
+}
