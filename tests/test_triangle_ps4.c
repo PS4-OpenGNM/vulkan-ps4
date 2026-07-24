@@ -203,10 +203,10 @@ int main(void) {
     /* 3. Get queue family */
     uint32_t qf_count = 0;
     vkGetPhysicalDeviceQueueFamilyProperties(phys, &qf_count, NULL);
-    VkQueueFamilyProperties qf = {0};
-    vkGetPhysicalDeviceQueueFamilyProperties(phys, &qf_count, &qf);
-    printf("Queue family: graphics=%d, count=%u\n",
-           !!(qf.queueFlags & VK_QUEUE_GRAPHICS_BIT), qf.queueCount);
+    VkQueueFamilyProperties qf[4] = {0};
+    vkGetPhysicalDeviceQueueFamilyProperties(phys, &qf_count, qf);
+    printf("Queue families: %u, family0: graphics=%d, count=%u\n",
+           qf_count, !!(qf[0].queueFlags & VK_QUEUE_GRAPHICS_BIT), qf[0].queueCount);
 
     /* 4. Create device + queue */
     float queue_pri = 1.0f;

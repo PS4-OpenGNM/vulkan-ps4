@@ -565,10 +565,11 @@ vk_ps4_GetDeviceQueue2(
     VkQueue *pQueue
 ) {
     if (!device || !pQueueInfo || !pQueue) return;
-    /* PS4 has a single queue family (0) with one queue (0).
+    /* PS4 has 2 queue families (0=graphics, 1=compute), each with 1 queue.
      * Delegate to GetDeviceQueue, ignoring flags (no protected queues). */
-    if (pQueueInfo->queueFamilyIndex == 0 && pQueueInfo->queueIndex == 0) {
-        vk_ps4_GetDeviceQueue(device, 0, 0, pQueue);
+    if (pQueueInfo->queueIndex == 0 &&
+        pQueueInfo->queueFamilyIndex < VK_PS4_NUM_QUEUE_FAMILIES) {
+        vk_ps4_GetDeviceQueue(device, pQueueInfo->queueFamilyIndex, 0, pQueue);
     } else {
         *pQueue = VK_NULL_HANDLE;
     }

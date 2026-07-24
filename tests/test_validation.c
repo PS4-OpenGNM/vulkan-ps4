@@ -156,8 +156,13 @@ int main(int argc, char **argv) {
     /* Queue family */
     uint32_t qf_count = 0;
     vkGetPhysicalDeviceQueueFamilyProperties(phys, &qf_count, NULL);
-    VkQueueFamilyProperties qf = {0};
-    vkGetPhysicalDeviceQueueFamilyProperties(phys, &qf_count, &qf);
+    VkQueueFamilyProperties qf[4] = {0};
+    vkGetPhysicalDeviceQueueFamilyProperties(phys, &qf_count, qf);
+    printf("Queue families: %u\n", qf_count);
+    for (uint32_t qi = 0; qi < qf_count; qi++) {
+        printf("  Family %u: flags=0x%x queues=%u\n",
+               qi, qf[qi].queueFlags, qf[qi].queueCount);
+    }
 
     /* Device */
     float queue_priority = 1.0f;
@@ -2455,6 +2460,84 @@ int main(int argc, char **argv) {
             vkDestroyShaderModule(dev, good_mod, NULL);
         } else {
             fprintf(stderr, "SPIR-V validation: valid shader rejected: %d\n", vr);
+            vc.errors++;
+        }
+    }
+
+    /* 17f. Multi-queue support — 2 queue families, get compute queue */
+    {
+        /* Query queue family properties — should report 2 families */
+        uint32_t qf_count2 = 0;
+        vkGetPhysicalDeviceQueueFamilyProperties(phys, &qf_count2, NULL);
+        if (qf_count2 >= 2) {
+            VkQueueFamilyProperties qf2[2] = {0};
+            vkGetPhysicalDeviceQueueFamilyProperties(phys, &qf_count2, qf2);
+            int has_gfx = (qf2[0].queueFlags & VK_QUEUE_GRAPHICS_BIT) != 0;
+            int has_comp_only = (qf2[1].queueFlags & VK_QUEUE_COMPUTE_BIT) != 0 &&
+                                  !(qf2[1].queueFlags & VK_QUEUE_GRAPHICS_BIT);
+            if (has_gfx && has_comp_only) {
+                printf("Multi-queue: family 0 (graphics+compute), family 1 (compute-only) OK\n");
+            } else {
+                fprintf(stderr, "Multi-queue: family flags wrong (0=0x%x, 1=0x%x)\n",
+                        qf2[0].queueFlags, qf2[1].queueFlags);
+                vc.errors++;
+            }
+
+            /* Create a device with both queue families */
+            float prios[2] = {1.0f, 0.5f};
+            VkDeviceQueueCreateInfo qcis[2] = {0};
+            qcis[0].sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
+            qcis[0].queueFamilyIndex = 0;
+            qcis[0].queueCount = 1;
+            qcis[0].pQueuePriorities = &prios[0];
+            qcis[1].sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
+            qcis[1].queueFamilyIndex = 1;
+            qcis[1].queueCount = 1;
+            qcis[1].pQueuePriorities = &prios[1];
+
+            VkDeviceCreateInfo dci2 = {0};
+            dci2.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
+            dci2.queueCreateInfoCount = 2;
+            dci2.pQueueCreateInfos = qcis;
+
+            VkDevice dev2 = VK_NULL_HANDLE;
+            vr = vkCreateDevice(phys, &dci2, NULL, &dev2);
+            if (vr == VK_SUCCESS) {
+                printf("Multi-queue: device with 2 queue families created OK\n");
+
+                /* Get both queues */
+                VkQueue gfx_queue = VK_NULL_HANDLE, comp_queue = VK_NULL_HANDLE;
+                vkGetDeviceQueue(dev2, 0, 0, &gfx_queue);
+                vkGetDeviceQueue(dev2, 1, 0, &comp_queue);
+                if (gfx_queue && comp_queue) {
+                    printf("Multi-queue: graphics + compute queues retrieved OK\n");
+                } else {
+                    fprintf(stderr, "Multi-queue: queue retrieval failed (gfx=%p, comp=%p)\n",
+                            (void*)gfx_queue, (void*)comp_queue);
+                    vc.errors++;
+                }
+
+                /* Test GetDeviceQueue2 */
+                VkDeviceQueueInfo2 dqi2 = {0};
+                dqi2.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_INFO_2;
+                dqi2.queueFamilyIndex = 1;
+                dqi2.queueIndex = 0;
+                VkQueue comp_queue2 = VK_NULL_HANDLE;
+                vkGetDeviceQueue2(dev2, &dqi2, &comp_queue2);
+                if (comp_queue2) {
+                    printf("Multi-queue: GetDeviceQueue2 for compute family OK\n");
+                } else {
+                    fprintf(stderr, "Multi-queue: GetDeviceQueue2 returned NULL\n");
+                    vc.errors++;
+                }
+
+                vkDestroyDevice(dev2, NULL);
+            } else {
+                fprintf(stderr, "Multi-queue: device create with 2 families failed: %d\n", vr);
+                vc.errors++;
+            }
+        } else {
+            fprintf(stderr, "Multi-queue: expected 2 queue families, got %u\n", qf_count2);
             vc.errors++;
         }
     }

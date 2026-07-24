@@ -100,10 +100,10 @@ static int test_instance_creation(void) {
     printf("  Getting queue family properties... ");
     uint32_t qf_count = 0;
     vk_ps4_GetPhysicalDeviceQueueFamilyProperties(phys, &qf_count, NULL);
-    VkQueueFamilyProperties qf = {0};
-    vk_ps4_GetPhysicalDeviceQueueFamilyProperties(phys, &qf_count, &qf);
+    VkQueueFamilyProperties qf[4] = {0};
+    vk_ps4_GetPhysicalDeviceQueueFamilyProperties(phys, &qf_count, qf);
     printf("OK (families=%u, flags=0x%x, queues=%u)\n",
-           qf_count, qf.queueFlags, qf.queueCount);
+           qf_count, qf[0].queueFlags, qf[0].queueCount);
 
     /* Get features */
     printf("  Getting physical device features... ");

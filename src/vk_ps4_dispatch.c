@@ -251,8 +251,19 @@ vk_ps4_GetPhysicalDeviceQueueFamilyProperties2(VkPhysicalDevice physicalDevice,
         vk_ps4_GetPhysicalDeviceQueueFamilyProperties(physicalDevice,
             pQueueFamilyPropertyCount, NULL);
     } else {
+        /* Extract the inner VkQueueFamilyProperties pointers from each
+         * VkQueueFamilyProperties2 struct so we can fill them in a batch. */
+        uint32_t count = *pQueueFamilyPropertyCount;
+        VkQueueFamilyProperties props[VK_PS4_NUM_QUEUE_FAMILIES];
+        for (uint32_t i = 0; i < count && i < VK_PS4_NUM_QUEUE_FAMILIES; i++) {
+            props[i] = pQueueFamilyProperties[i].queueFamilyProperties;
+        }
         vk_ps4_GetPhysicalDeviceQueueFamilyProperties(physicalDevice,
-            pQueueFamilyPropertyCount, &pQueueFamilyProperties->queueFamilyProperties);
+            &count, props);
+        for (uint32_t i = 0; i < count && i < VK_PS4_NUM_QUEUE_FAMILIES; i++) {
+            pQueueFamilyProperties[i].queueFamilyProperties = props[i];
+        }
+        *pQueueFamilyPropertyCount = count;
     }
 }
 

@@ -166,10 +166,16 @@ struct VkPs4Device {
 };
 
 /* === Queue === */
+/* Queue family indices — must match GetPhysicalDeviceQueueFamilyProperties */
+#define VK_PS4_QUEUE_FAMILY_GRAPHICS 0
+#define VK_PS4_QUEUE_FAMILY_COMPUTE  1
+#define VK_PS4_NUM_QUEUE_FAMILIES    2
+
 struct VkPs4Queue {
     VkPs4ObjectType type;
     VkPs4Device *device;
     uint32_t family_index;
+    VkQueueFlags flags;  /* cached from family properties */
     /* Submit serialization — opaque pointer to platform-specific mutex */
     void *submit_mutex;
 };

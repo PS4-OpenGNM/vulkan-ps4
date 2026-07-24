@@ -333,18 +333,39 @@ vk_ps4_GetPhysicalDeviceQueueFamilyProperties(
         return;
     }
     if (!pQueueFamilyProperties) {
-        *pQueueFamilyPropertyCount = 1;
+        *pQueueFamilyPropertyCount = VK_PS4_NUM_QUEUE_FAMILIES;
         return;
     }
-    if (*pQueueFamilyPropertyCount < 1) {
+    if (*pQueueFamilyPropertyCount < VK_PS4_NUM_QUEUE_FAMILIES) {
+        /* Report as many as fit */
+        if (*pQueueFamilyPropertyCount >= 1) {
+            pQueueFamilyProperties[0].queueFlags =
+                VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT | VK_QUEUE_TRANSFER_BIT;
+            pQueueFamilyProperties[0].queueCount = 1;
+            pQueueFamilyProperties[0].timestampValidBits = 64;
+            pQueueFamilyProperties[0].minImageTransferGranularity = (VkExtent3D){1, 1, 1};
+        }
         return;
     }
+    /* Family 0: Graphics + Compute + Transfer (the universal queue) */
     pQueueFamilyProperties[0].queueFlags =
         VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT | VK_QUEUE_TRANSFER_BIT;
     pQueueFamilyProperties[0].queueCount = 1;
     pQueueFamilyProperties[0].timestampValidBits = 64;
     pQueueFamilyProperties[0].minImageTransferGranularity = (VkExtent3D){1, 1, 1};
-    *pQueueFamilyPropertyCount = 1;
+
+    /* Family 1: Compute + Transfer (async compute queue).
+     * On PS4 (GCN Liverpool), the ACE (Async Compute Engine) can run
+     * compute shaders in parallel with graphics.  sceGnmMapComputeQueue
+     * maps an ACE pipe to a virtual compute queue.  On host builds the
+     * compute queue submits through the same path as graphics. */
+    pQueueFamilyProperties[1].queueFlags =
+        VK_QUEUE_COMPUTE_BIT | VK_QUEUE_TRANSFER_BIT;
+    pQueueFamilyProperties[1].queueCount = 1;
+    pQueueFamilyProperties[1].timestampValidBits = 64;
+    pQueueFamilyProperties[1].minImageTransferGranularity = (VkExtent3D){1, 1, 1};
+
+    *pQueueFamilyPropertyCount = VK_PS4_NUM_QUEUE_FAMILIES;
 }
 
 VKAPI_ATTR void VKAPI_CALL

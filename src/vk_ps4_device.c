@@ -219,6 +219,16 @@ vk_ps4_CreateDevice(
             queue->type = VK_PS4_OBJ_QUEUE;
             queue->device = dev;
             queue->family_index = qci->queueFamilyIndex;
+            /* Set queue flags based on family index */
+            if (qci->queueFamilyIndex == VK_PS4_QUEUE_FAMILY_GRAPHICS) {
+                queue->flags = VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT |
+                               VK_QUEUE_TRANSFER_BIT;
+            } else if (qci->queueFamilyIndex == VK_PS4_QUEUE_FAMILY_COMPUTE) {
+                queue->flags = VK_QUEUE_COMPUTE_BIT | VK_QUEUE_TRANSFER_BIT;
+            } else {
+                queue->flags = VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT |
+                               VK_QUEUE_TRANSFER_BIT;
+            }
             dev->queues[dev->queue_count++] = queue;
         }
     }
