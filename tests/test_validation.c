@@ -2407,6 +2407,58 @@ int main(int argc, char **argv) {
         }
     }
 
+    /* 17e. SPIR-V validation — invalid SPIR-V rejected, valid accepted */
+    {
+        /* Invalid: bad magic number.
+         * Note: VVL will also report an error for this (expected).
+         * We decrement vc.errors to compensate for the expected VVL error. */
+        uint32_t bad_spirv[] = {0xDEADBEEF, 0x00010000, 0, 0, 0};
+        VkShaderModuleCreateInfo bad_smci = {0};
+        bad_smci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+        bad_smci.codeSize = sizeof(bad_spirv);
+        bad_smci.pCode = bad_spirv;
+        VkShaderModule bad_mod = VK_NULL_HANDLE;
+        int errors_before = vc.errors;
+        vr = vkCreateShaderModule(dev, &bad_smci, NULL, &bad_mod);
+        if (vr != VK_SUCCESS) {
+            printf("SPIR-V validation: invalid magic rejected OK (vr=%d)\n", vr);
+            /* Compensate for expected VVL error */
+            if (vc.errors > errors_before) vc.errors = errors_before;
+        } else {
+            fprintf(stderr, "SPIR-V validation: bad magic should have been rejected\n");
+            vkDestroyShaderModule(dev, bad_mod, NULL);
+            vc.errors++;
+        }
+
+        /* Valid: minimal SPIR-V vertex shader (void main() {}) */
+        static const uint32_t valid_spirv[] = {
+            0x07230203, 0x00010000, 0x0008000b, 0x00000006,
+            0x00000000, 0x00020011, 0x00000001, 0x0006000b,
+            0x00000001, 0x4c534c47, 0x6474732e, 0x3035342e,
+            0x00000000, 0x0003000e, 0x00000000, 0x00000001,
+            0x0005000f, 0x00000000, 0x00000004, 0x6e69616d,
+            0x00000000, 0x00030003, 0x00000002, 0x000001c2,
+            0x00040005, 0x00000004, 0x6e69616d, 0x00000000,
+            0x00020013, 0x00000002, 0x00030021, 0x00000003,
+            0x00000002, 0x00050036, 0x00000002, 0x00000004,
+            0x00000000, 0x00000003, 0x000200f8, 0x00000005,
+            0x000100fd, 0x00010038,
+        };
+        VkShaderModuleCreateInfo good_smci = {0};
+        good_smci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+        good_smci.codeSize = sizeof(valid_spirv);
+        good_smci.pCode = valid_spirv;
+        VkShaderModule good_mod = VK_NULL_HANDLE;
+        vr = vkCreateShaderModule(dev, &good_smci, NULL, &good_mod);
+        if (vr == VK_SUCCESS) {
+            printf("SPIR-V validation: valid shader accepted OK\n");
+            vkDestroyShaderModule(dev, good_mod, NULL);
+        } else {
+            fprintf(stderr, "SPIR-V validation: valid shader rejected: %d\n", vr);
+            vc.errors++;
+        }
+    }
+
     /* Deferred resource cleanup — must happen after the command
      * buffer has finished executing, not while it's still recording. */
     /* Push constant resources */

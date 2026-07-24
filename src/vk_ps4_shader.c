@@ -9,9 +9,14 @@
 #include "vk_ps4_internal.h"
 
 #include <string.h>
+#include <stdio.h>
 
 #ifdef VK_PS4_HAVE_PSBC
 #include "psbc_compile.h"
+#endif
+
+#ifdef VK_PS4_HAVE_SPIRV_TOOLS
+#include <spirv-tools/libspirv.h>
 #endif
 
 VKAPI_ATTR VkResult VKAPI_CALL
@@ -26,6 +31,55 @@ vk_ps4_CreateShaderModule(VkDevice device, const VkShaderModuleCreateInfo *pCrea
 
     VkPs4Device *dev = (VkPs4Device *)device;
     const VkAllocationCallbacks *alloc = pAllocator ? pAllocator : &dev->allocator;
+
+    /* Basic SPIR-V sanity checks:
+     * - codeSize must be a multiple of 4 (SPIR-V is a stream of uint32_t)
+     * - minimum size is the 5-word header (20 bytes)
+     * - magic number must be 0x07230203 */
+    size_t spirv_size = pCreateInfo->codeSize;
+    if (spirv_size == 0 || !pCreateInfo->pCode) {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    if (spirv_size < 20 || (spirv_size % 4) != 0) {
+        return VK_ERROR_INVALID_SHADER_NV;
+    }
+    const uint32_t *spirv_words = (const uint32_t *)pCreateInfo->pCode;
+    if (spirv_words[0] != 0x07230203) {
+        /* Not a valid SPIR-V magic number */
+        return VK_ERROR_INVALID_SHADER_NV;
+    }
+
+#ifdef VK_PS4_HAVE_SPIRV_TOOLS
+    /* Validate SPIR-V using SPIRV-Tools before storing it.
+     * This catches malformed shaders early — before pipeline creation
+     * triggers the expensive psbc compile path.  We use Vulkan 1.1
+     * target env since the ICD advertises Vulkan 1.1. */
+    {
+        spv_context ctx = spvContextCreate(SPV_ENV_VULKAN_1_1);
+        if (ctx) {
+            spv_diagnostic diag = NULL;
+            spv_result_t result = spvValidateBinary(
+                ctx,
+                spirv_words,
+                spirv_size / sizeof(uint32_t),
+                &diag
+            );
+            if (result != SPV_SUCCESS) {
+                if (diag) {
+                    fprintf(stderr, "vk_ps4: SPIR-V validation failed: %s\n",
+                            diag->error ? diag->error : "(no message)");
+                    spvDiagnosticDestroy(diag);
+                } else {
+                    fprintf(stderr, "vk_ps4: SPIR-V validation failed (code %d)\n", result);
+                }
+                spvContextDestroy(ctx);
+                return VK_ERROR_INVALID_SHADER_NV;
+            }
+            if (diag) spvDiagnosticDestroy(diag);
+            spvContextDestroy(ctx);
+        }
+    }
+#endif
 
     VkPs4ShaderModule *mod = vk_ps4_alloc_zero(alloc, sizeof(*mod), 16);
     if (!mod) return VK_ERROR_OUT_OF_HOST_MEMORY;
@@ -45,12 +99,8 @@ vk_ps4_CreateShaderModule(VkDevice device, const VkShaderModuleCreateInfo *pCrea
      * However, for the MVP we can try to detect the stage from SPIR-V
      * capabilities. For now, just store the SPIR-V and defer compilation. */
 
-    /* Store a copy of the SPIR-V for later compilation */
-    size_t spirv_size = pCreateInfo->codeSize;
-    if (spirv_size == 0 || !pCreateInfo->pCode) {
-        vk_ps4_free(alloc, mod);
-        return VK_ERROR_INITIALIZATION_FAILED;
-    }
+    /* Store a copy of the SPIR-V for later compilation.
+     * spirv_size and pCode were already validated above. */
     void *spirv_copy = vk_ps4_alloc(alloc, spirv_size, 4);
     if (!spirv_copy) {
         vk_ps4_free(alloc, mod);
@@ -62,12 +112,8 @@ vk_ps4_CreateShaderModule(VkDevice device, const VkShaderModuleCreateInfo *pCrea
     mod->binary = spirv_copy;
     mod->binary_size = spirv_size;
 #else
-    /* No libpsbc — store SPIR-V as-is (stub mode) */
-    size_t spirv_size = pCreateInfo->codeSize;
-    if (spirv_size == 0 || !pCreateInfo->pCode) {
-        vk_ps4_free(alloc, mod);
-        return VK_ERROR_INITIALIZATION_FAILED;
-    }
+    /* No libpsbc — store SPIR-V as-is (stub mode).
+     * spirv_size and pCode were already validated above. */
     void *spirv_copy = vk_ps4_alloc(alloc, spirv_size, 4);
     if (!spirv_copy) {
         vk_ps4_free(alloc, mod);

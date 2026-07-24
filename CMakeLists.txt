@@ -48,6 +48,23 @@ else()
     message(STATUS "libpsbc not found — using stub shader path")
 endif()
 
+# SPIRV-Tools — SPIR-V validation (optional, host build only)
+set(VK_PS4_HAVE_SPIRV_TOOLS OFF)
+if(NOT VK_PS4_ORBIS)
+    find_path(SPIRV_TOOLS_INCLUDE_DIR spirv-tools/libspirv.h
+        HINTS /opt/homebrew/include
+        DOC "Path to SPIRV-Tools headers")
+    find_library(SPIRV_TOOLS_LIBRARY SPIRV-Tools
+        HINTS /opt/homebrew/lib
+        DOC "Path to SPIRV-Tools library")
+    if(SPIRV_TOOLS_INCLUDE_DIR AND SPIRV_TOOLS_LIBRARY)
+        set(VK_PS4_HAVE_SPIRV_TOOLS ON)
+        message(STATUS "SPIRV-Tools found — SPIR-V validation enabled")
+    else()
+        message(STATUS "SPIRV-Tools not found — SPIR-V validation disabled")
+    endif()
+endif()
+
 include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${VK_HEADERS_ROOT}/include
@@ -57,6 +74,10 @@ include_directories(
 if(VK_PS4_HAVE_PSBC)
     include_directories(${PSBC_ROOT}/libpsbc)
     include_directories(${PSBC_ROOT}/include)
+endif()
+
+if(VK_PS4_HAVE_SPIRV_TOOLS)
+    include_directories(${SPIRV_TOOLS_INCLUDE_DIR})
 endif()
 
 # Vulkan ICD loader interface version
@@ -141,6 +162,12 @@ if(VK_PS4_HAVE_PSBC)
         set(VK_PS4_HAVE_PSBC OFF)
     endif()
     target_compile_definitions(vulkan_ps4 PRIVATE VK_PS4_HAVE_PSBC=1)
+endif()
+
+# Link SPIRV-Tools for SPIR-V validation (host only)
+if(VK_PS4_HAVE_SPIRV_TOOLS)
+    target_link_libraries(vulkan_ps4 PRIVATE ${SPIRV_TOOLS_LIBRARY})
+    target_compile_definitions(vulkan_ps4 PRIVATE VK_PS4_HAVE_SPIRV_TOOLS=1)
 endif()
 
 # Tests (host only)
