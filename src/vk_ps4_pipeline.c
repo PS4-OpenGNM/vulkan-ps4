@@ -101,8 +101,11 @@ vk_ps4_CreateGraphicsPipelines(VkDevice device, VkPipelineCache pipelineCache,
                                 const VkGraphicsPipelineCreateInfo *pCreateInfos,
                                 const VkAllocationCallbacks *pAllocator,
                                 VkPipeline *pPipelines) {
+    VK_PS4_LOG_ENTRY();
+    vk_ps4_log("CreateGraphicsPipelines: count=%u", createInfoCount);
 
     if (!device || !pCreateInfos || !pPipelines) {
+        vk_ps4_log_raw("CreateGraphicsPipelines: NULL args, FAIL");
         return VK_ERROR_INITIALIZATION_FAILED;
     }
 

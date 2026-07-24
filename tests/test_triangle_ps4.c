@@ -12,6 +12,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "vk_ps4_log.h"
 
 /* Simple vertex data: position (vec2) + color (vec3) */
 static const float g_vertices[] = {
@@ -177,16 +178,24 @@ static const uint32_t g_frag_spv[] = {
 int main(void) {
     printf("=== vulkan-ps4 PS4 Triangle Test ===\n");
 
+    /* Open breadcrumb log early so all ICD calls are traced */
+    vk_ps4_log_open("/data/vk_ps4_breadcrumb.log");
+    vk_ps4_log_raw("=== test_triangle_ps4 started ===");
+
     /* 1. Create instance */
+    vk_ps4_log_raw("TEST: creating instance");
     VkInstanceCreateInfo inst_ci = {0};
     inst_ci.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
     VkInstance inst = VK_NULL_HANDLE;
     VkResult vr = vkCreateInstance(&inst_ci, NULL, &inst);
     if (vr != VK_SUCCESS) {
         printf("vkCreateInstance failed: %d\n", vr);
+        vk_ps4_log("TEST: vkCreateInstance FAILED: %d", (int)vr);
+        vk_ps4_log_close();
         return 1;
     }
     printf("Instance created OK\n");
+    vk_ps4_log_raw("TEST: instance OK");
 
     /* 2. Enumerate physical device */
     uint32_t phys_count = 0;
@@ -225,18 +234,23 @@ int main(void) {
     dev_ci.ppEnabledExtensionNames = dev_exts;
 
     VkDevice dev = VK_NULL_HANDLE;
+    vk_ps4_log_raw("TEST: creating device");
     vr = vkCreateDevice(phys, &dev_ci, NULL, &dev);
     if (vr != VK_SUCCESS) {
         printf("vkCreateDevice failed: %d\n", vr);
+        vk_ps4_log("TEST: vkCreateDevice FAILED: %d", (int)vr);
         vkDestroyInstance(inst, NULL);
+        vk_ps4_log_close();
         return 1;
     }
     printf("Device created OK\n");
+    vk_ps4_log_raw("TEST: device OK");
 
     VkQueue queue;
     vkGetDeviceQueue(dev, 0, 0, &queue);
 
     /* 5. Create swapchain */
+    vk_ps4_log_raw("TEST: creating swapchain");
     VkSurfaceKHR surface = VK_NULL_HANDLE;
     /* On PS4, the swapchain creates the surface internally via sceVideoOut.
      * We pass VK_NULL_HANDLE as the surface — the ICD handles it. */
@@ -260,11 +274,14 @@ int main(void) {
     vr = vkCreateSwapchainKHR(dev, &sw_ci, NULL, &swapchain);
     if (vr != VK_SUCCESS) {
         printf("vkCreateSwapchainKHR failed: %d\n", vr);
+        vk_ps4_log("TEST: vkCreateSwapchainKHR FAILED: %d", (int)vr);
         vkDestroyDevice(dev, NULL);
         vkDestroyInstance(inst, NULL);
+        vk_ps4_log_close();
         return 1;
     }
     printf("Swapchain created OK (1920x1080)\n");
+    vk_ps4_log_raw("TEST: swapchain OK");
 
     /* 6. Get swapchain images */
     uint32_t sw_img_count = 0;
@@ -357,6 +374,7 @@ int main(void) {
     printf("Vertex buffer created OK\n");
 
     /* 10. Create shader modules */
+    vk_ps4_log_raw("TEST: creating shader modules");
     VkShaderModuleCreateInfo vs_ci = {0};
     vs_ci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
     vs_ci.codeSize = sizeof(g_vert_spv);
@@ -371,6 +389,7 @@ int main(void) {
     VkShaderModule fs_mod;
     vkCreateShaderModule(dev, &fs_ci, NULL, &fs_mod);
     printf("Shader modules created OK\n");
+    vk_ps4_log_raw("TEST: shader modules OK");
 
     /* 11. Create graphics pipeline */
     VkPipelineShaderStageCreateInfo stages[2] = {0};
@@ -456,11 +475,14 @@ int main(void) {
     gpci.subpass = 0;
 
     VkPipeline pipeline;
+    vk_ps4_log_raw("TEST: creating graphics pipeline");
     vr = vkCreateGraphicsPipelines(dev, VK_NULL_HANDLE, 1, &gpci, NULL, &pipeline);
     if (vr != VK_SUCCESS) {
         printf("vkCreateGraphicsPipelines failed: %d\n", vr);
+        vk_ps4_log("TEST: vkCreateGraphicsPipelines FAILED: %d", (int)vr);
     } else {
         printf("Pipeline created OK\n");
+        vk_ps4_log_raw("TEST: pipeline OK");
     }
 
     /* 12. Create command pool + buffer */
@@ -491,9 +513,10 @@ int main(void) {
     VkFence flight_fence;
     vkCreateFence(dev, &fence_ci, NULL, &flight_fence);
 
-    /* 14. Render loop — 60 frames then exit */
-    printf("Starting render loop (60 frames)...\n");
-    for (int frame = 0; frame < 60; frame++) {
+    /* 14. Render loop — 600 frames (~10 seconds at 60fps) then exit */
+    printf("Starting render loop (600 frames)...\n");
+    vk_ps4_log_raw("TEST: render loop start (600 frames)");
+    for (int frame = 0; frame < 600; frame++) {
         vkWaitForFences(dev, 1, &flight_fence, VK_TRUE, 1000000000ULL);
         vkResetFences(dev, 1, &flight_fence);
 
@@ -502,6 +525,7 @@ int main(void) {
                                    image_avail, VK_NULL_HANDLE, &img_idx);
         if (vr != VK_SUCCESS) {
             printf("vkAcquireNextImageKHR failed: %d (frame %d)\n", vr, frame);
+            vk_ps4_log("TEST: AcquireNextImage FAILED frame=%d vr=%d", frame, (int)vr);
             break;
         }
 
@@ -546,6 +570,7 @@ int main(void) {
         vr = vkQueueSubmit(queue, 1, &submit, flight_fence);
         if (vr != VK_SUCCESS) {
             printf("vkQueueSubmit failed: %d (frame %d)\n", vr, frame);
+            vk_ps4_log("TEST: QueueSubmit FAILED frame=%d vr=%d", frame, (int)vr);
             break;
         }
 
@@ -560,15 +585,20 @@ int main(void) {
         vr = vkQueuePresentKHR(queue, &present);
         if (vr != VK_SUCCESS) {
             printf("vkQueuePresentKHR failed: %d (frame %d)\n", vr, frame);
+            vk_ps4_log("TEST: QueuePresent FAILED frame=%d vr=%d", frame, (int)vr);
             break;
         }
 
-        if (frame % 10 == 0)
+        if (frame % 60 == 0) {
             printf("  Frame %d OK\n", frame);
+            vk_ps4_log("TEST: frame %d OK", frame);
+        }
     }
     printf("Render loop done\n");
+    vk_ps4_log_raw("TEST: render loop done");
 
     /* 15. Cleanup */
+    vk_ps4_log_raw("TEST: cleanup start");
     vkDeviceWaitIdle(dev);
     vkDestroyFence(dev, flight_fence, NULL);
     vkDestroySemaphore(dev, image_avail, NULL);
@@ -591,6 +621,8 @@ int main(void) {
     vkDestroySwapchainKHR(dev, swapchain, NULL);
     vkDestroyDevice(dev, NULL);
     vkDestroyInstance(inst, NULL);
+    vk_ps4_log_raw("TEST: cleanup done");
+    vk_ps4_log_close();
 
     printf("=== Test complete ===\n");
     return 0;

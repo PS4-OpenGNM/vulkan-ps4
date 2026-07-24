@@ -46,6 +46,25 @@ extern "C" {
 #define VK_PS4_API_VERSION VK_MAKE_VERSION(1, 1, 0)
 #define VK_PS4_DRIVER_VERSION VK_MAKE_VERSION(0, 1, 0)
 
+/* === Breadcrumb logging (PS4 hardware debugging) === */
+/* Opens a breadcrumb log file.  Default path on PS4: /data/vk_ps4_breadcrumb.log
+ * On host: /tmp/vk_ps4_breadcrumb.log.  Call early in main() or CreateInstance. */
+void vk_ps4_log_open(const char *path);
+void vk_ps4_log_close(void);
+/* Printf-style breadcrumb.  Flushes after every write so logs survive crashes. */
+void vk_ps4_log(const char *fmt, ...);
+/* Single-string breadcrumb (no varargs overhead). */
+void vk_ps4_log_raw(const char *msg);
+bool vk_ps4_log_is_open(void);
+
+/* Convenience macro for logging function entry */
+#define VK_PS4_LOG_ENTRY() \
+    vk_ps4_log_raw(__func__)
+
+/* Log with VkResult */
+#define VK_PS4_LOG_VR(call_name, result) \
+    vk_ps4_log("%s -> %d", (call_name), (int)(result))
+
 /* === Memory types === */
 /* PS4 has two memory types:
  *   0 = Onion  (CPU-coherent, GPU-visible — for staging)

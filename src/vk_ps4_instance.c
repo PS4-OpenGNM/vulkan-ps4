@@ -16,7 +16,15 @@ vk_ps4_CreateInstance(
     const VkAllocationCallbacks *pAllocator,
     VkInstance *pInstance
 ) {
+    /* Open breadcrumb log on first instance creation if not already open */
+    if (!vk_ps4_log_is_open()) {
+        vk_ps4_log_open(NULL);
+        vk_ps4_log_raw("CreateInstance: log opened");
+    }
+    VK_PS4_LOG_ENTRY();
+
     if (!pCreateInfo || !pInstance) {
+        vk_ps4_log_raw("CreateInstance: NULL args, FAIL");
         return VK_ERROR_INITIALIZATION_FAILED;
     }
 

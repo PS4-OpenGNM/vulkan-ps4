@@ -92,7 +92,8 @@ VK_PS4_SRCS := \
 	src/vk_ps4_sync.c \
 	src/vk_ps4_query.c \
 	src/vk_ps4_stubs.c \
-	src/vk_ps4_vulkan11.c
+	src/vk_ps4_vulkan11.c \
+	src/vk_ps4_log.c
 
 VK_PS4_OBJS := $(VK_PS4_SRCS:.c=.orbis.o)
 

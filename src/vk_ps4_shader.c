@@ -22,6 +22,7 @@
 VKAPI_ATTR VkResult VKAPI_CALL
 vk_ps4_CreateShaderModule(VkDevice device, const VkShaderModuleCreateInfo *pCreateInfo,
                           const VkAllocationCallbacks *pAllocator, VkShaderModule *pShaderModule) {
+    VK_PS4_LOG_ENTRY();
     if (!device || !pCreateInfo || !pShaderModule) {
         return VK_ERROR_INITIALIZATION_FAILED;
     }
@@ -68,9 +69,12 @@ vk_ps4_CreateShaderModule(VkDevice device, const VkShaderModuleCreateInfo *pCrea
                 if (diag) {
                     fprintf(stderr, "vk_ps4: SPIR-V validation failed: %s\n",
                             diag->error ? diag->error : "(no message)");
+                    vk_ps4_log("CreateShaderModule: SPIR-V validation FAILED: %s",
+                               diag->error ? diag->error : "(no message)");
                     spvDiagnosticDestroy(diag);
                 } else {
                     fprintf(stderr, "vk_ps4: SPIR-V validation failed (code %d)\n", result);
+                    vk_ps4_log("CreateShaderModule: SPIR-V validation FAILED (code %d)", result);
                 }
                 spvContextDestroy(ctx);
                 return VK_ERROR_INVALID_SHADER_NV;
@@ -125,6 +129,7 @@ vk_ps4_CreateShaderModule(VkDevice device, const VkShaderModuleCreateInfo *pCrea
 #endif
 
     *pShaderModule = (VkShaderModule)mod;
+    vk_ps4_log("CreateShaderModule: OK (size=%zu)", spirv_size);
     return VK_SUCCESS;
 }
 
@@ -162,16 +167,19 @@ VkResult vk_ps4_compile_shader_module(VkPs4ShaderModule *mod, VkShaderStageFlagB
     opts.optimise = true;
 
     /* Determine stage */
+    const char *stage_name = "unknown";
     switch (stage) {
-    case VK_SHADER_STAGE_VERTEX_BIT: opts.stage = PSBC_STAGE_VERTEX; break;
-    case VK_SHADER_STAGE_FRAGMENT_BIT: opts.stage = PSBC_STAGE_FRAGMENT; break;
-    case VK_SHADER_STAGE_COMPUTE_BIT: opts.stage = PSBC_STAGE_COMPUTE; break;
-    case VK_SHADER_STAGE_GEOMETRY_BIT: opts.stage = PSBC_STAGE_GEOMETRY; break;
-    case VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT: opts.stage = PSBC_STAGE_TESS_CTRL; break;
-    case VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT: opts.stage = PSBC_STAGE_TESS_EVAL; break;
+    case VK_SHADER_STAGE_VERTEX_BIT: opts.stage = PSBC_STAGE_VERTEX; stage_name = "VS"; break;
+    case VK_SHADER_STAGE_FRAGMENT_BIT: opts.stage = PSBC_STAGE_FRAGMENT; stage_name = "PS"; break;
+    case VK_SHADER_STAGE_COMPUTE_BIT: opts.stage = PSBC_STAGE_COMPUTE; stage_name = "CS"; break;
+    case VK_SHADER_STAGE_GEOMETRY_BIT: opts.stage = PSBC_STAGE_GEOMETRY; stage_name = "GS"; break;
+    case VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT: opts.stage = PSBC_STAGE_TESS_CTRL; stage_name = "TCS"; break;
+    case VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT: opts.stage = PSBC_STAGE_TESS_EVAL; stage_name = "TES"; break;
     default:
+        vk_ps4_log("compile_shader: unsupported stage %u", (unsigned)stage);
         return VK_ERROR_FEATURE_NOT_PRESENT;
     }
+    vk_ps4_log("compile_shader: %s spirv=%zu bytes", stage_name, mod->binary_size);
 
     /* Compile */
     PsbcShaderOutput output = {0};
@@ -183,8 +191,10 @@ VkResult vk_ps4_compile_shader_module(VkPs4ShaderModule *mod, VkShaderStageFlagB
     );
 
     if (result != PSBC_RESULT_OK) {
+        vk_ps4_log("compile_shader: %s FAILED psbc_result=%d", stage_name, (int)result);
         return VK_ERROR_FEATURE_NOT_PRESENT;
     }
+    vk_ps4_log("compile_shader: %s OK binary=%zu bytes", stage_name, output.size);
 
     /* Copy the compiled binary */
     void *binary_copy = vk_ps4_alloc(alloc, output.size, 16);

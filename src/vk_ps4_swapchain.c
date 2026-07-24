@@ -14,7 +14,9 @@
 VKAPI_ATTR VkResult VKAPI_CALL
 vk_ps4_CreateSwapchainKHR(VkDevice device, const VkSwapchainCreateInfoKHR *pCreateInfo,
                           const VkAllocationCallbacks *pAllocator, VkSwapchainKHR *pSwapchain) {
+    VK_PS4_LOG_ENTRY();
     if (!device || !pCreateInfo || !pSwapchain) {
+        vk_ps4_log_raw("CreateSwapchainKHR: NULL args, FAIL");
         return VK_ERROR_INITIALIZATION_FAILED;
     }
 
@@ -60,11 +62,15 @@ vk_ps4_CreateSwapchainKHR(VkDevice device, const VkSwapchainCreateInfoKHR *pCrea
     }
 
     /* Open VideoOut */
+    vk_ps4_log("CreateSwapchainKHR: VideoOutOpen %ux%u buffers=%u",
+               width, height, vo_info.numbuffers);
     GnmError err = sceGnmVideoOutOpen(&sc->video_out, &vo_info);
     if (err != GNM_ERROR_OK) {
+        vk_ps4_log("CreateSwapchainKHR: VideoOutOpen FAILED: %d", (int)err);
         vk_ps4_free(alloc, sc);
         return VK_ERROR_INITIALIZATION_FAILED;
     }
+    vk_ps4_log_raw("CreateSwapchainKHR: VideoOutOpen OK");
 
     /* Create VkImage wrappers for each VideoOut buffer */
     sc->image_count = vo_info.numbuffers;
@@ -334,11 +340,14 @@ vk_ps4_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR *pPresentInfo) {
 
         /* Submit flip for this buffer */
         if (image_index < sc->image_count) {
+            vk_ps4_log("QueuePresent: flip img=%u frame=%lld",
+                       image_index, (long long)sc->video_out.frame);
             sceGnmVideoOutSubmitFlipAndWait(
                 &sc->video_out, image_index, (int64_t)sc->video_out.frame,
                 GNM_VIDEO_OUT_FLIP_VSYNC
             );
             sc->video_out.frame++;
+            vk_ps4_log_raw("QueuePresent: flip done");
             /* The flip is complete — the display engine is done
              * with the buffer.  Clear the in-flight tracking so
              * AcquireNextImageKHR can reclaim this image. */

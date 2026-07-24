@@ -34,18 +34,22 @@ static VkResult vk_ps4_device_init_gnm(VkPs4Device *dev) {
     const uint64_t cmd_bytes = (uint64_t)VK_PS4_GNM_INIT_CMD_DWORDS * sizeof(uint32_t);
     const uint64_t alignment = 64 * 1024; /* 64KB Garlic alignment */
 
+    vk_ps4_log_raw("init_gnm: allocating Garlic direct memory");
     GnmError err = sceGnmDirectMemoryAllocate(
         &dev->gnm_init_mem, cmd_bytes, alignment,
         GNM_DIRECT_MEMORY_TYPE_WC_GARLIC, GNM_PROT_CPU_GPU_RW
     );
     if (err != GNM_ERROR_OK) {
+        vk_ps4_log("init_gnm: DirectMemoryAllocate FAILED: %d", (int)err);
         return VK_ERROR_INITIALIZATION_FAILED;
     }
+    vk_ps4_log_raw("init_gnm: Garlic memory allocated OK");
 
     dev->gnm_init_cmd = (uint32_t *)dev->gnm_init_mem.mapped;
     dev->gnm_init_cmd_dwords = 0;
 
     /* Build the init command buffer in the mapped direct memory. */
+    vk_ps4_log_raw("init_gnm: building init command buffer");
     GnmCommandBuffer cmd = sceGnmCmdInit(
         dev->gnm_init_cmd, (uint32_t)cmd_bytes, NULL, NULL
     );
@@ -54,22 +58,28 @@ static VkResult vk_ps4_device_init_gnm(VkPs4Device *dev) {
     uint32_t used_dwords = (uint32_t)(cmd.cmdptr - cmd.beginptr);
     uint32_t used_bytes = used_dwords * sizeof(uint32_t);
     dev->gnm_init_cmd_dwords = used_dwords;
+    vk_ps4_log("init_gnm: init CB built (%u dwords)", used_dwords);
 
     /* Submit the one-shot init packet.  On Orbis this programs the GPU's
      * default context state; on the host generic build it is a no-op. */
+    vk_ps4_log_raw("init_gnm: submitting init command buffer");
     void *dcb_addr = dev->gnm_init_cmd;
     int32_t result = sceGnmSubmitCommandBuffers(
         1, &dcb_addr, &used_bytes, NULL, NULL
     );
     if (result != 0) {
+        vk_ps4_log("init_gnm: SubmitCommandBuffers FAILED: %d", result);
         sceGnmDirectMemoryRelease(&dev->gnm_init_mem);
         dev->gnm_init_cmd = NULL;
         dev->gnm_init_cmd_dwords = 0;
         return VK_ERROR_INITIALIZATION_FAILED;
     }
+    vk_ps4_log_raw("init_gnm: SubmitCommandBuffers OK");
 
+    vk_ps4_log_raw("init_gnm: calling sceGnmSubmitDone");
     result = sceGnmSubmitDone();
     if (result != 0) {
+        vk_ps4_log("init_gnm: SubmitDone FAILED: %d", result);
         /* SubmitDone failure means the init packet was rejected; the GPU
          * may be in an indeterminate state, so treat this as fatal. */
         sceGnmDirectMemoryRelease(&dev->gnm_init_mem);
@@ -77,6 +87,7 @@ static VkResult vk_ps4_device_init_gnm(VkPs4Device *dev) {
         dev->gnm_init_cmd_dwords = 0;
         return VK_ERROR_INITIALIZATION_FAILED;
     }
+    vk_ps4_log_raw("init_gnm: SubmitDone OK");
 
     /* Allocate the epilogue command buffer used by QueueSubmit for EOP
          * fence/semaphore signal writes.  Small and reused across submits. */
@@ -159,7 +170,9 @@ vk_ps4_CreateDevice(
     const VkAllocationCallbacks *pAllocator,
     VkDevice *pDevice
 ) {
+    VK_PS4_LOG_ENTRY();
     if (!physicalDevice || !pCreateInfo || !pDevice) {
+        vk_ps4_log_raw("CreateDevice: NULL args, FAIL");
         return VK_ERROR_INITIALIZATION_FAILED;
     }
     VkPs4PhysicalDevice *phys = (VkPs4PhysicalDevice *)physicalDevice;
@@ -184,19 +197,23 @@ vk_ps4_CreateDevice(
     /* Initialize libpsbc once per device — refcounted internally.
      * This avoids calling psbc_init/psbc_shutdown on every shader compile. */
     psbc_init();
+    vk_ps4_log_raw("CreateDevice: psbc_init done");
 #endif
 
     /* Submit the GNM default-hardware-state preamble so the GPU is in a
      * known state before any Vulkan command buffer is submitted.  This
      * replaces the previous "TODO: init GNM on PS4" stub. */
+    vk_ps4_log_raw("CreateDevice: calling vk_ps4_device_init_gnm");
     VkResult gnm_result = vk_ps4_device_init_gnm(dev);
     if (gnm_result != VK_SUCCESS) {
+        vk_ps4_log("CreateDevice: gnm init FAILED: %d", (int)gnm_result);
 #ifdef VK_PS4_HAVE_PSBC
         psbc_shutdown();
 #endif
         vk_ps4_free(alloc, dev);
         return gnm_result;
     }
+    vk_ps4_log_raw("CreateDevice: GNM init OK");
 
     /* Pre-allocate queues from pCreateInfo so handles are stable */
     dev->queue_count = 0;
@@ -234,6 +251,7 @@ vk_ps4_CreateDevice(
     }
 
     *pDevice = (VkDevice)dev;
+    vk_ps4_log("CreateDevice: OK (queues=%u)", dev->queue_count);
     return VK_SUCCESS;
 }
 

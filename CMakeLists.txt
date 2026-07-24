@@ -114,6 +114,7 @@ set(VK_PS4_SOURCES
     src/vk_ps4_query.c
     src/vk_ps4_stubs.c
     src/vk_ps4_vulkan11.c
+    src/vk_ps4_log.c
 )
 
 # Build as a shared library (ICD) on all platforms.

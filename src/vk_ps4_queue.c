@@ -64,6 +64,7 @@ vk_ps4_QueueSubmit(VkQueue queue, uint32_t submitCount, const VkSubmitInfo *pSub
     }
     VkPs4Queue *q = (VkPs4Queue *)queue;
     VkPs4Device *dev = q->device;
+    vk_ps4_log("QueueSubmit: count=%u family=%u", submitCount, q->family_index);
 
     for (uint32_t i = 0; i < submitCount; i++) {
         const VkSubmitInfo *submit = &pSubmits[i];
@@ -121,11 +122,15 @@ vk_ps4_QueueSubmit(VkQueue queue, uint32_t submitCount, const VkSubmitInfo *pSub
 
             /* Submit to GNM — pass NULL for ccb_addrs and ccb_sizes
              * since we don't use a separate constant command buffer. */
+            vk_ps4_log("QueueSubmit: sceGnmSubmitCommandBuffers dwords=%u",
+                       cmd->pm4_used);
             int32_t result = sceGnmSubmitCommandBuffers(
                 1, &dcb_addr, &cmd_size_bytes, NULL, NULL
             );
 
             if (result != 0) {
+                vk_ps4_log("QueueSubmit: sceGnmSubmitCommandBuffers FAILED: %d",
+                           result);
                 /* Submission failed — signal fence to avoid deadlock */
                 if (fence) {
                     VkPs4Fence *f = (VkPs4Fence *)fence;
